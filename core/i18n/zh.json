@@ -15,14 +15,46 @@
     },
     "component_not_ready": "{command} 执行失败：{component}未初始化。\n请先执行 /lmem status 检查插件状态；如状态异常请查看启动日志。",
     "suggestions": {
-      "status": ["确认数据库文件可读写","确认记忆引擎已完成初始化","查看日志中的异常堆栈定位具体模块"],
-      "search": ["确认关键词不为空且长度合理","确认数据库和索引文件存在且可读写","检查日志中是否有检索组件初始化失败信息"],
-      "forget": ["确认记忆 ID 存在且属于当前可访问数据","确认数据库未被其他进程长时间占用","查看日志中的删除调用堆栈"],
-      "rebuild_index": ["确认 Embedding Provider 已可用","确认数据库文件与索引文件可读写","根据日志定位失败文档后重试重建"],
-      "rebuild_graph": ["确认图记忆功能已启用","确认数据库与索引文件可读写","查看日志定位具体失败文档"],
-      "summarize": ["确认当前会话至少有 2 条未总结消息","确认 LLM Provider 可正常响应","检查日志中的 summary 处理堆栈"],
-      "reset": ["确认会话 ID 有效且会话存储可访问","确认数据库未被占用","查看日志中的 clear_session 调用堆栈"],
-      "cleanup": ["确认当前会话存在可读取的历史记录","确认对话存储可读写","查看日志中的 cleanup 调用堆栈"]
+      "status": [
+        "确认数据库文件可读写",
+        "确认记忆引擎已完成初始化",
+        "查看日志中的异常堆栈定位具体模块"
+      ],
+      "search": [
+        "确认关键词不为空且长度合理",
+        "确认数据库和索引文件存在且可读写",
+        "检查日志中是否有检索组件初始化失败信息"
+      ],
+      "forget": [
+        "确认记忆 ID 存在且属于当前可访问数据",
+        "确认数据库未被其他进程长时间占用",
+        "查看日志中的删除调用堆栈"
+      ],
+      "rebuild_index": [
+        "确认 Embedding Provider 已可用",
+        "确认数据库文件与索引文件可读写",
+        "根据日志定位失败文档后重试重建"
+      ],
+      "rebuild_graph": [
+        "确认图记忆功能已启用",
+        "确认数据库与索引文件可读写",
+        "查看日志定位具体失败文档"
+      ],
+      "summarize": [
+        "确认当前会话至少有 2 条未总结消息",
+        "确认 LLM Provider 可正常响应",
+        "检查日志中的 summary 处理堆栈"
+      ],
+      "reset": [
+        "确认会话 ID 有效且会话存储可访问",
+        "确认数据库未被占用",
+        "查看日志中的 clear_session 调用堆栈"
+      ],
+      "cleanup": [
+        "确认当前会话存在可读取的历史记录",
+        "确认对话存储可读写",
+        "查看日志中的 cleanup 调用堆栈"
+      ]
     }
   },
   "status": {
@@ -91,7 +123,7 @@
     "notice_exec": "AstrBot 对话历史已更新，记忆注入片段已清理。"
   },
   "help": {
-    "text": "LivingMemory 使用指南\n\n核心指令:\n/lmem status              查看系统状态\n/lmem search <关键词> [数量]  搜索记忆(默认5条)\n/lmem forget <ID>          删除指定记忆\n/lmem rebuild-index       重建索引（修复索引不一致）\n/lmem rebuild-graph       重建图记忆索引（回填旧记忆）\n/lmem webui               查看 WebUI 管理界面入口\n/lmem summarize [message_count]  立即总结，或重新总结最近指定条数的消息\n/lmem reset               重置当前会话记忆上下文\n/lmem cleanup [preview|exec] 清理历史消息中的记忆片段(默认preview预演)\n/lmem help                显示此帮助\n\n使用建议:\n• 日常查询使用 search 指令\n• 复杂管理请在 AstrBot 仪表盘中进入 插件 -> LivingMemory -> Pages -> dashboard\n• 记忆会自动保存对话内容\n• 使用 forget 删除敏感信息\n• 索引不一致时执行 rebuild-index\n• 启用图记忆后建议执行 rebuild-graph 回填旧数据\n• 更新插件后建议执行 cleanup 清理旧数据\n\ncleanup 命令示例:\n  /lmem cleanup          # 预演模式,仅显示统计\n  /lmem cleanup preview  # 同上\n  /lmem cleanup exec     # 执行实际清理\n\n更多信息: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory"
+    "text": "LivingMemory 使用指南\n\n核心指令:\n/lmem status              查看系统状态\n/lmem search <关键词> [数量]  搜索记忆(默认5条)\n/lmem forget <ID>          删除指定记忆\n/lmem rebuild-index       重建索引（修复索引不一致）\n/lmem rebuild-graph       重建图记忆索引（回填旧记忆）\n/lmem webui               查看 WebUI 管理界面入口\n/lmem summarize [message_count]  立即总结，或重新总结最近指定条数的消息\n/lmem reset               重置当前会话记忆上下文\n/lmem cleanup [preview|exec] 清理历史消息中的记忆片段(默认preview预演)\n/lmem core [list|add|del]  管理常驻核心记忆\n/lmem help                显示此帮助\n\n使用建议:\n• 日常查询使用 search 指令\n• 复杂管理请在 AstrBot 仪表盘中进入 插件 -> LivingMemory -> Pages -> dashboard\n• 记忆会自动保存对话内容\n• 使用 forget 删除敏感信息\n• 索引不一致时执行 rebuild-index\n• 启用图记忆后建议执行 rebuild-graph 回填旧数据\n• 更新插件后建议执行 cleanup 清理旧数据\n\ncleanup 命令示例:\n  /lmem cleanup          # 预演模式,仅显示统计\n  /lmem cleanup preview  # 同上\n  /lmem cleanup exec     # 执行实际清理\n\n更多信息: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory"
   },
   "init": {
     "ready": "插件已就绪。可使用 /lmem help 查看可用命令。",
@@ -101,5 +133,17 @@
   "command": {
     "not_ready": "命令处理器尚未就绪，当前命令无法执行。\n请先执行 /lmem status 查看插件状态；若持续失败，请检查初始化日志。",
     "core_not_ready": "插件核心组件未初始化。\n请先执行 /lmem status 查看初始化状态；如仍失败，请检查启动日志中的异常堆栈。"
+  },
+  "core": {
+    "action_name": "核心记忆管理",
+    "list_empty": "暂无核心记忆。用 /lmem core add <内容> 添加一条。",
+    "list_header": "核心记忆（共 {count} 条，常驻注入）：",
+    "list_row": "#{id} [{kind}|{scope}|P{priority}] {label}：{text}",
+    "add_missing": "用法: /lmem core add <内容> [label=名称 kind=rule|boundary|preference|stable_fact scope=global|session priority=0-100]",
+    "add_success": "已添加核心记忆 #{id}（{label}），每轮注入常驻。",
+    "del_missing": "用法: /lmem core del <ID>（ID 见 /lmem core list）",
+    "del_success": "已删除核心记忆 #{id}。",
+    "del_not_found": "删除失败：核心记忆 #{id} 不存在。",
+    "usage": "用法: /lmem core list | /lmem core add <内容> [参数] | /lmem core del <ID>"
   }
 }

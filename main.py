@@ -30,7 +30,7 @@ from .core.passive_group_capture import (
     set_active_plugin,
 )
 from .core.plugin_initializer import PluginInitializer
-from .core.tools import MemoryMemorizeTool, MemorySearchTool
+from .core.tools import CoreMemoryTool, MemoryMemorizeTool, MemorySearchTool
 
 _MIN_ASTRBOT_VERSION = "4.24.2"
 _ASTRBOT_DISTRIBUTION_NAMES = ("AstrBot", "astrbot")
@@ -313,6 +313,13 @@ class LivingMemoryPlugin(Star):
                     memory_processor=self.initializer.memory_processor,
                 )
             )
+        if self.config_manager.get("agent_tools.enable_core_memory_tool", True):
+            tools.append(
+                CoreMemoryTool(
+                    config_manager=self.config_manager,
+                    memory_engine=self.initializer.memory_engine,
+                )
+            )
 
         if tools:
             self.context.add_llm_tools(*tools)
@@ -497,6 +504,38 @@ class LivingMemoryPlugin(Star):
             return
 
         async for message in self.command_handler.handle_forget(event, doc_id):
+            yield message
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("core")
+    async def core(
+        self, event: AstrMessageEvent, action: str = "list"
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """[Admin] Manage resident core memory: /lmem core list|add|del"""
+        ready, message = await self._ensure_plugin_ready()
+        if not ready:
+            yield event.plain_result(message)
+            return
+
+        if not self.command_handler:
+            yield event.plain_result(self._command_handler_not_ready_message())
+            return
+
+        # 整行自行解析：add 的内容含空格，逐词参数绑定会被截断
+        rest = ""
+        raw = str(getattr(event, "message_str", "") or "")
+        lowered = raw.lower()
+        marker = "core"
+        start = lowered.find(marker, lowered.find("lmem"))
+        if start >= 0:
+            tail = raw[start + len(marker):].strip()
+            tokens = tail.split(None, 1)
+            if len(tokens) == 2:
+                action, rest = tokens[0], tokens[1]
+            elif tokens:
+                action = tokens[0]
+
+        async for message in self.command_handler.handle_core(event, action, rest):
             yield message
 
     @permission_type(PermissionType.ADMIN)

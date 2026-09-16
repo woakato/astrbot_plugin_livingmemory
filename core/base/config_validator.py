@@ -154,6 +154,9 @@ class AgentToolsConfig(BaseModel):
     enable_memorize_tool: bool = Field(
         default=False, description="是否启用 Agent 主动记忆写入工具"
     )
+    enable_core_memory_tool: bool = Field(
+        default=True, description="是否启用 Agent 核心记忆管理工具"
+    )
 
 
 class ForgettingAgentConfig(BaseModel):

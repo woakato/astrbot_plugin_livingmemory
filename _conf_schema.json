@@ -478,6 +478,12 @@
         "hint": "开启后注册 memorize_long_term_memory，允许 Agent 主动写入长期记忆。",
         "type": "bool",
         "default": false
+      },
+      "enable_core_memory_tool": {
+        "description": "启用核心记忆管理工具",
+        "hint": "开启后注册 manage_core_memory，允许 Agent 记/查/删每轮常驻的核心记忆（规则、边界、偏好）。",
+        "type": "bool",
+        "default": true
       }
     }
   },

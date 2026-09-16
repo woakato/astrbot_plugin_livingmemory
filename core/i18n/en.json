@@ -15,14 +15,46 @@
     },
     "component_not_ready": "{command} failed: {component} is not initialized.\nPlease run /lmem status to check plugin status; if abnormal, check startup logs.",
     "suggestions": {
-      "status": ["Confirm database file is readable/writable", "Confirm memory engine initialization is complete", "Check logs for exception stack trace to locate specific module"],
-      "search": ["Confirm keyword is not empty and of reasonable length", "Confirm database and index files exist and are readable/writable", "Check logs for retrieval component initialization failure"],
-      "forget": ["Confirm memory ID exists and belongs to currently accessible data", "Confirm database is not occupied by another process for a long time", "Check logs for delete call stack"],
-      "rebuild_index": ["Confirm Embedding Provider is available", "Confirm database and index files are readable/writable", "Locate failed documents from logs and retry rebuild"],
-      "rebuild_graph": ["Confirm graph memory feature is enabled", "Confirm database and index files are readable/writable", "Check logs to locate specific failed documents"],
-      "summarize": ["Confirm current session has at least 2 unsummarized messages", "Confirm LLM Provider responds normally", "Check logs for summary processing stack trace"],
-      "reset": ["Confirm session ID is valid and session storage is accessible", "Confirm database is not occupied", "Check logs for clear_session call stack"],
-      "cleanup": ["Confirm current session has readable historical records", "Confirm conversation storage is readable/writable", "Check logs for cleanup call stack"]
+      "status": [
+        "Confirm database file is readable/writable",
+        "Confirm memory engine initialization is complete",
+        "Check logs for exception stack trace to locate specific module"
+      ],
+      "search": [
+        "Confirm keyword is not empty and of reasonable length",
+        "Confirm database and index files exist and are readable/writable",
+        "Check logs for retrieval component initialization failure"
+      ],
+      "forget": [
+        "Confirm memory ID exists and belongs to currently accessible data",
+        "Confirm database is not occupied by another process for a long time",
+        "Check logs for delete call stack"
+      ],
+      "rebuild_index": [
+        "Confirm Embedding Provider is available",
+        "Confirm database and index files are readable/writable",
+        "Locate failed documents from logs and retry rebuild"
+      ],
+      "rebuild_graph": [
+        "Confirm graph memory feature is enabled",
+        "Confirm database and index files are readable/writable",
+        "Check logs to locate specific failed documents"
+      ],
+      "summarize": [
+        "Confirm current session has at least 2 unsummarized messages",
+        "Confirm LLM Provider responds normally",
+        "Check logs for summary processing stack trace"
+      ],
+      "reset": [
+        "Confirm session ID is valid and session storage is accessible",
+        "Confirm database is not occupied",
+        "Check logs for clear_session call stack"
+      ],
+      "cleanup": [
+        "Confirm current session has readable historical records",
+        "Confirm conversation storage is readable/writable",
+        "Check logs for cleanup call stack"
+      ]
     }
   },
   "status": {
@@ -91,7 +123,7 @@
     "notice_exec": "AstrBot conversation history has been updated, memory injection fragments have been cleaned."
   },
   "help": {
-    "text": "LivingMemory User Guide\n\nCore commands:\n/lmem status              View system status\n/lmem search <keyword> [count]  Search memories (default 5)\n/lmem forget <ID>          Delete specified memory\n/lmem rebuild-index       Rebuild index (fix inconsistency)\n/lmem rebuild-graph       Rebuild graph memory index (backfill old data)\n/lmem webui               Show WebUI management interface entry\n/lmem summarize [message_count]  Summarize now or re-summarize the latest messages\n/lmem reset               Reset current session memory context\n/lmem cleanup [preview|exec] Clean up memory injection fragments in historical messages (default preview)\n/lmem help                Show this help\n\nUsage tips:\n• Use search command for daily queries\n• For complex management, go to Plugins -> LivingMemory -> Pages -> dashboard in AstrBot Dashboard\n• Memories are automatically saved from conversations\n• Use forget to delete sensitive information\n• Execute rebuild-index when index is inconsistent\n• After enabling graph memory, execute rebuild-graph to backfill old data\n• After plugin update, execute cleanup to clean old data\n\ncleanup command examples:\n  /lmem cleanup          # Preview mode, shows statistics only\n  /lmem cleanup preview  # Same as above\n  /lmem cleanup exec     # Perform actual cleanup\n\nMore info: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory"
+    "text": "LivingMemory User Guide\n\nCore commands:\n/lmem status              View system status\n/lmem search <keyword> [count]  Search memories (default 5)\n/lmem forget <ID>          Delete specified memory\n/lmem rebuild-index       Rebuild index (fix inconsistency)\n/lmem rebuild-graph       Rebuild graph memory index (backfill old data)\n/lmem webui               Show WebUI management interface entry\n/lmem summarize [message_count]  Summarize now or re-summarize the latest messages\n/lmem reset               Reset current session memory context\n/lmem cleanup [preview|exec] Clean up memory injection fragments in historical messages (default preview)\n/lmem core [list|add|del]   Manage resident core memories\n/lmem help                Show this help\n\nUsage tips:\n• Use search command for daily queries\n• For complex management, go to Plugins -> LivingMemory -> Pages -> dashboard in AstrBot Dashboard\n• Memories are automatically saved from conversations\n• Use forget to delete sensitive information\n• Execute rebuild-index when index is inconsistent\n• After enabling graph memory, execute rebuild-graph to backfill old data\n• After plugin update, execute cleanup to clean old data\n\ncleanup command examples:\n  /lmem cleanup          # Preview mode, shows statistics only\n  /lmem cleanup preview  # Same as above\n  /lmem cleanup exec     # Perform actual cleanup\n\nMore info: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory"
   },
   "init": {
     "ready": "Plugin is ready. Use /lmem help to view available commands.",
@@ -101,5 +133,17 @@
   "command": {
     "not_ready": "Command handler is not ready, current command cannot be executed.\nPlease run /lmem status to check plugin status; if it keeps failing, check initialization logs.",
     "core_not_ready": "Plugin core components are not initialized.\nPlease run /lmem status to check initialization status; if it still fails, check the exception stack trace in startup logs."
+  },
+  "core": {
+    "action_name": "core memory management",
+    "list_empty": "No core memories yet. Add one with /lmem core add <text>.",
+    "list_header": "Core memories ({count} total, resident every turn):",
+    "list_row": "#{id} [{kind}|{scope}|P{priority}] {label}: {text}",
+    "add_missing": "Usage: /lmem core add <text> [label=name kind=rule|boundary|preference|stable_fact scope=global|session priority=0-100]",
+    "add_success": "Core memory #{id} added ({label}); resident in every injection.",
+    "del_missing": "Usage: /lmem core del <ID> (see /lmem core list)",
+    "del_success": "Core memory #{id} deleted.",
+    "del_not_found": "Delete failed: core memory #{id} not found.",
+    "usage": "Usage: /lmem core list | /lmem core add <text> [options] | /lmem core del <ID>"
   }
 }

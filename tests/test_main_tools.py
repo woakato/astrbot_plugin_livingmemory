@@ -3,7 +3,11 @@
 from unittest.mock import Mock
 
 from astrbot_plugin_livingmemory.core.base.config_manager import ConfigManager
-from astrbot_plugin_livingmemory.core.tools import MemoryMemorizeTool, MemorySearchTool
+from astrbot_plugin_livingmemory.core.tools import (
+    CoreMemoryTool,
+    MemoryMemorizeTool,
+    MemorySearchTool,
+)
 from astrbot_plugin_livingmemory.main import (
     LivingMemoryPlugin,
     _parse_version,
@@ -44,13 +48,15 @@ def test_register_llm_tools_is_idempotent():
     assert set(tools_by_name) == {
         "recall_long_term_memory",
         "memorize_long_term_memory",
+        "manage_core_memory",
     }
     assert isinstance(tools_by_name["recall_long_term_memory"], MemorySearchTool)
     assert isinstance(tools_by_name["memorize_long_term_memory"], MemoryMemorizeTool)
+    assert isinstance(tools_by_name["manage_core_memory"], CoreMemoryTool)
     assert plugin._llm_tools_registered is True
 
 
-def test_register_llm_tools_defaults_only_recall():
+def test_register_llm_tools_defaults_recall_and_core():
     plugin = LivingMemoryPlugin.__new__(LivingMemoryPlugin)
     plugin.context = Mock()
     plugin.config_manager = ConfigManager()
@@ -63,8 +69,12 @@ def test_register_llm_tools_defaults_only_recall():
 
     plugin.context.add_llm_tools.assert_called_once()
     tools = plugin.context.add_llm_tools.call_args.args
-    assert [tool.name for tool in tools] == ["recall_long_term_memory"]
+    assert [tool.name for tool in tools] == [
+        "recall_long_term_memory",
+        "manage_core_memory",
+    ]
     assert isinstance(tools[0], MemorySearchTool)
+    assert isinstance(tools[1], CoreMemoryTool)
     assert plugin._llm_tools_registered is True
 
 
@@ -113,8 +123,12 @@ def test_register_llm_tools_respects_recall_tool_disabled():
 
     plugin.context.add_llm_tools.assert_called_once()
     tools = plugin.context.add_llm_tools.call_args.args
-    assert [tool.name for tool in tools] == ["memorize_long_term_memory"]
+    assert [tool.name for tool in tools] == [
+        "memorize_long_term_memory",
+        "manage_core_memory",
+    ]
     assert isinstance(tools[0], MemoryMemorizeTool)
+    assert isinstance(tools[1], CoreMemoryTool)
     assert plugin._llm_tools_registered is True
 
 
@@ -133,8 +147,12 @@ def test_register_llm_tools_respects_memorize_tool_disabled():
 
     plugin.context.add_llm_tools.assert_called_once()
     tools = plugin.context.add_llm_tools.call_args.args
-    assert [tool.name for tool in tools] == ["recall_long_term_memory"]
+    assert [tool.name for tool in tools] == [
+        "recall_long_term_memory",
+        "manage_core_memory",
+    ]
     assert isinstance(tools[0], MemorySearchTool)
+    assert isinstance(tools[1], CoreMemoryTool)
     assert plugin._llm_tools_registered is True
 
 
@@ -142,7 +160,13 @@ def test_register_llm_tools_respects_all_tools_disabled():
     plugin = LivingMemoryPlugin.__new__(LivingMemoryPlugin)
     plugin.context = Mock()
     plugin.config_manager = ConfigManager(
-        {"agent_tools": {"enable_recall_tool": False, "enable_memorize_tool": False}}
+        {
+            "agent_tools": {
+                "enable_recall_tool": False,
+                "enable_memorize_tool": False,
+                "enable_core_memory_tool": False,
+            }
+        }
     )
     plugin.initializer = Mock()
     plugin.initializer.memory_engine = Mock()

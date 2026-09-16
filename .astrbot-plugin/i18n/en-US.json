@@ -251,6 +251,10 @@
       "enable_memorize_tool": {
         "description": "Enable Active Memory Write Tool",
         "hint": "When enabled, registers memorize_long_term_memory so the Agent can actively write long-term memories."
+      },
+      "enable_core_memory_tool": {
+        "description": "Core memory tool",
+        "hint": "Registers manage_core_memory so the agent can add/list/delete resident core memories (rules, boundaries, preferences)."
       }
     },
     "graph_memory": {

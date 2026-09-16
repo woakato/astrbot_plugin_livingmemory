@@ -231,6 +231,122 @@ class CommandHandler:
                 )
             )
 
+    async def handle_core(
+        self,
+        event: AstrMessageEvent,
+        action: str = "list",
+        rest: str = "",
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """处理 /lmem core list|add|del 命令（常驻核心记忆管理）。
+
+        Args:
+            action: list | add | del.
+            rest: greedy remainder (declared as GreedyStr at the command
+                layer). For add: "<内容> [label=.. kind=.. scope=..
+                priority=..]"; for del: "<id>".
+        """
+        if not self.memory_engine:
+            yield event.plain_result(
+                self._component_not_ready_message("记忆引擎", "/lmem core")
+            )
+            return
+
+        action = (action or "").strip().lower()
+        if action in ("", "list", "ls"):
+            try:
+                items = await self.memory_engine.list_core_memories()
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"核心记忆列表失败: {exc}", exc_info=True)
+                yield event.plain_result(
+                    self._format_error_message(t("core.action_name"), exc)
+                )
+                return
+            if not items:
+                yield event.plain_result(t("core.list_empty"))
+                return
+            lines = [t("core.list_header", count=len(items))]
+            for item in items:
+                lines.append(
+                    t(
+                        "core.list_row",
+                        id=item["memory_id"],
+                        label=item["label"] or "-",
+                        kind=item["kind"],
+                        scope=item["scope"],
+                        priority=int(item["priority"]),
+                        text=item["text"],
+                    )
+                )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "add":
+            tokens = (rest or "").split()
+            options: dict[str, str] = {}
+            content_parts: list[str] = []
+            for token in tokens:
+                key, sep, val = token.partition("=")
+                if sep and key.lower() in ("label", "kind", "scope", "priority"):
+                    options[key.lower()] = val
+                else:
+                    content_parts.append(token)
+            content = " ".join(content_parts)
+            if not content.strip():
+                yield event.plain_result(t("core.add_missing"))
+                return
+            label = options.get("label", "rule")[:60]
+            kind = options.get("kind", "rule")[:30]
+            scope = options.get("scope", "global")
+            if scope not in ("global", "session", "persona", "user"):
+                scope = "global"
+            try:
+                priority = max(0, min(100, int(options.get("priority", "50"))))
+            except ValueError:
+                priority = 50
+            session_id = None
+            if scope == "session":
+                session_id = resolve_memory_scope(self.config_manager, event) \
+                    or event.unified_msg_origin
+            try:
+                memory_id = await self.memory_engine.add_core_memory(
+                    content,
+                    label=label,
+                    kind=kind,
+                    priority=priority,
+                    scope=scope,
+                    session_id=session_id,
+                )
+                yield event.plain_result(
+                    t("core.add_success", id=memory_id, label=label or "-")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"添加核心记忆失败: {exc}", exc_info=True)
+                yield event.plain_result(
+                    self._format_error_message(t("core.action_name"), exc)
+                )
+            return
+
+        if action == "del":
+            try:
+                memory_id = int((rest or "").split()[0])
+            except (IndexError, ValueError):
+                yield event.plain_result(t("core.del_missing"))
+                return
+            try:
+                ok = await self.memory_engine.delete_core_memory(memory_id)
+                if ok:
+                    yield event.plain_result(t("core.del_success", id=memory_id))
+                else:
+                    yield event.plain_result(t("core.del_not_found", id=memory_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"删除核心记忆失败: {exc}", exc_info=True)
+                yield event.plain_result(
+                    self._format_error_message(t("core.action_name"), exc)
+                )
+            return
+
+        yield event.plain_result(t("core.usage"))
+
     async def handle_rebuild_index(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:

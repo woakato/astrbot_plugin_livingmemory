@@ -1344,6 +1344,65 @@ class MemoryEngineCrudMixin:
             })
         return blocks
 
+    async def list_core_memories(self) -> list[dict[str, Any]]:
+        """List every core memory row (for management command/tool)."""
+        if self.db_connection is None:
+            return []
+        try:
+            cursor = await self.db_connection.execute(
+                """
+                SELECT id, text, metadata
+                FROM documents
+                WHERE UPPER(COALESCE(json_extract(metadata, '$.memory_type'),
+                                     'GENERAL')) = 'CORE_MEMORY'
+                  AND COALESCE(json_extract(metadata, '$.status'), 'active') = 'core'
+                ORDER BY CAST(COALESCE(json_extract(metadata, '$.core_priority'), 50) AS REAL) DESC
+                LIMIT 200
+                """
+            )
+            rows = await cursor.fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[核心记忆] 列表查询失败: {exc}")
+            return []
+        items = []
+        for row in rows:
+            meta = safe_json_dict(row["metadata"])
+            items.append({
+                "memory_id": int(row["id"]),
+                "label": str(meta.get("core_label") or ""),
+                "kind": str(meta.get("core_kind") or "rule"),
+                "priority": float(meta.get("core_priority") or 50),
+                "scope": str(meta.get("core_scope") or "global"),
+                "session_id": str(meta.get("core_session_id") or ""),
+                "persona_id": str(meta.get("core_persona_id") or ""),
+                "text": str(row["text"] or ""),
+            })
+        return items
+
+    async def delete_core_memory(self, memory_id: int) -> bool:
+        """Remove a core memory row directly (no FAISS/BM25 side to sync).
+
+        Core rows never entered similarity indexes (status='core'), so a
+        plain documents-row delete is the complete removal.
+        """
+        if self.db_connection is None:
+            return False
+        cursor = await self.db_connection.execute(
+            """
+            DELETE FROM documents
+            WHERE id = ?
+              AND UPPER(COALESCE(json_extract(metadata, '$.memory_type'),
+                                 'GENERAL')) = 'CORE_MEMORY'
+              AND COALESCE(json_extract(metadata, '$.status'), 'active') = 'core'
+            """,
+            (int(memory_id),),
+        )
+        await self.db_connection.commit()
+        if cursor.rowcount > 0:
+            self._invalidate_search_cache()
+            return True
+        return False
+
     async def load_open_loop_memories(
         self, *, session_id: str | None = None, limit: int = 6
     ) -> list[dict[str, Any]]:
