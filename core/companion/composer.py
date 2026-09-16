@@ -89,6 +89,7 @@ class PackageComposer:
         retrieval_items: list[MemoryItem] | None = None,
         current_message: str = "",
         window_label: str = "",
+        suppress_empty_hint: bool = False,
     ) -> Package:
         """Build the package body.
 
@@ -101,6 +102,9 @@ class PackageComposer:
             retrieval_items: search results to pack under remaining budget.
             current_message: the live user message echoed into the package.
             window_label: session type/object label for the window block.
+            suppress_empty_hint: skip the "no relevant memory" sentence even
+                when retrieval is empty (used when search results travel in
+                a fake tool call instead of the package).
 
         Returns:
             A Package whose body is shared by both injection outlets.
@@ -204,7 +208,10 @@ class PackageComposer:
         if not hint_lines:
             if retrieval_items and any_dropped:
                 hint_lines.append(f"- {BUDGET_DROPPED_SENTENCE}")
-            elif not retrieval_items and not core_lines:
+            elif (
+                not retrieval_items and not core_lines
+                and not suppress_empty_hint
+            ):
                 hint_lines.append(f"- {EMPTY_RESULT_SENTENCE}")
         if hint_lines:
             body = "\n".join(hint_lines)
@@ -234,3 +241,34 @@ class PackageComposer:
             + package.body
             + "\n</memory_companion_context>\n</MemoryCompanion-Context>"
         )
+
+    def wrap_for_mainchain(self, package: Package) -> str:
+        """Wrap for the main-chain injection inside RAG-Faiss-Memory markers.
+
+        Reusing LivingMemory's header/footer markers means the existing
+        idempotent cleanup (temp-part detection on those markers) covers the
+        whole package with zero extra bookkeeping.
+        """
+        if not package.body:
+            return ""
+        from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
+
+        header_body = ""
+        footer_body = ""
+        try:
+            from ..prompts.prompt_manager import get_prompt_manager
+
+            mgr = get_prompt_manager()
+            if mgr is not None:
+                header_body = mgr.get_prompt("memory_injection_header")
+                footer_body = mgr.get_prompt("memory_injection_footer")
+        except Exception:  # noqa: BLE001
+            pass
+        parts = [MEMORY_INJECTION_HEADER]
+        if header_body:
+            parts.append(header_body)
+        parts.append(package.body)
+        if footer_body:
+            parts.append(footer_body)
+        parts.append(MEMORY_INJECTION_FOOTER)
+        return "\n\n".join(p for p in parts if p)

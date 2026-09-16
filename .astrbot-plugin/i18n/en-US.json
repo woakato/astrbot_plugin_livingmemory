@@ -448,6 +448,98 @@
         "description": "Semantic Similarity Threshold",
         "hint": "In semantic mode, two memories are grouped only when their similarity reaches this value. Allowed range: 0-1."
       }
+    },
+    "companion_bridge": {
+      "description": "Companion bridge",
+      "hint": "Integration bridge with the private_companion plugin. When off, the companion plugin falls back to local-only mode.",
+      "enabled": {
+        "description": "Bridge master switch",
+        "hint": "When off, companion handshake fails and all bridge features degrade to local mode."
+      },
+      "schedule_fast_context_enabled": {
+        "description": "Schedule fast context",
+        "hint": "Fast lane that returns today's mirrored entries when the companion generates its schedule."
+      },
+      "outfit_fast_context_enabled": {
+        "description": "Outfit fast context",
+        "hint": "Fast lane that returns today's preference entries when the companion makes its outfit photo."
+      },
+      "dedupe_prompt_context": {
+        "description": "Prompt dedupe",
+        "hint": "De-duplication coordination with the companion plugin (yield protocol). Recommended to keep on."
+      },
+      "prefer_memory_companion_memory": {
+        "description": "Memory authority",
+        "hint": "When the yield protocol is active, the companion yields schedule/profile prompt sections to memory-side injection."
+      },
+      "clean_proactive_history": {
+        "description": "Clean proactive noise",
+        "hint": "Merge overly dense proactive-message mirror entries when archiving."
+      },
+      "suppress_self_timeline_when_companion_seen": {
+        "description": "Self-timeline yield",
+        "hint": "If the companion already injected today's schedule this turn, the injection package skips the self-timeline slot."
+      },
+      "suppress_user_context_when_companion_seen": {
+        "description": "User context yield",
+        "hint": "If the companion already injected the user profile this turn, the injection package skips the profile slot."
+      },
+      "cross_window_emotional_continuity_enabled": {
+        "description": "Cross-window emotional continuity",
+        "hint": "Allow mood afterglow delivery across windows. Experimental, off by default."
+      }
+    },
+    "core_memory": {
+      "description": "Core memory (resident)",
+      "hint": "A few rules, boundaries and preferences injected every turn without retrieval. Manage via /lmem core or the agent tool.",
+      "enabled": {
+        "description": "Enable resident block",
+        "hint": "When off, core memories are no longer injected every turn."
+      },
+      "max_blocks": {
+        "description": "Max blocks",
+        "hint": "Cap of core memory blocks resident per turn. (range: 1-16)"
+      },
+      "max_chars": {
+        "description": "Core block budget",
+        "hint": "Total character budget for the resident block. (range: 200-2000)"
+      }
+    },
+    "companion_slots": {
+      "description": "Injection package slots",
+      "hint": "Each turn's memory package is packed under one budget from fixed slots plus retrieval results.",
+      "budget_chars": {
+        "description": "Package budget",
+        "hint": "Total character cap per memory injection package; lowest-priority items drop first. (range: 300-3000)"
+      },
+      "gate_enabled": {
+        "description": "Silence gate",
+        "hint": "Low-information / correction / small-talk messages skip long-term retrieval, saving tokens and avoiding awkward recalls."
+      },
+      "enable_core_block": {
+        "description": "Core block slot",
+        "hint": "Resident core memories enter the package."
+      },
+      "enable_mood_line": {
+        "description": "Mood afterglow slot",
+        "hint": "Un-acked emotion events condensed into one line in the package."
+      },
+      "enable_relationship_line": {
+        "description": "Relationship line slot",
+        "hint": "One-line relationship tone hint."
+      },
+      "enable_open_loops": {
+        "description": "Open loops slot",
+        "hint": "Unfinished commitments/topics, up to three lines."
+      },
+      "enable_self_line": {
+        "description": "Bot-self line slot",
+        "hint": "One line of the bot's own schedule/diary for today."
+      },
+      "enable_raw_quote": {
+        "description": "Important original quote",
+        "hint": "For commitment-type memories allow one 60-char original quote instead of paraphrase."
+      }
     }
   }
 }

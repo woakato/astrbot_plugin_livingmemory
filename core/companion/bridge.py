@@ -371,23 +371,34 @@ class CompanionBridge:
             return []
 
     async def _load_open_loops(self, session_id: str) -> list[MemoryItem]:
-        loader = getattr(self._plugin, "load_open_loops", None)
+        loader = getattr(self._engine(), "load_open_loop_memories", None)
         if loader is None:
             return []
         try:
-            return await loader(session_id=session_id, limit=3)
+            rows = await loader(session_id=session_id or None, limit=3)
         except Exception:  # noqa: BLE001
             return []
+        from .slots import _loop_text
+
+        return [
+            MemoryItem(text=_loop_text(row), source="open_loop",
+                       weight=0.5 if row.get("promise") else 0.0)
+            for row in rows
+        ]
 
     async def _afterglow_line(self, *, bot_id: str = "", session_id: str = "") -> list[tuple[str, str]]:
-        """Mood afterglow one-liner derived from un-acked ledger events."""
+        """Mood afterglow one-liner derived from un-acked ledger events.
+
+        Read-only (peek): delivery/ack consumption belongs to the companion
+        plugin's list_emotion_events, never to our own injection path.
+        """
         store = self._companion_store()
         if store is None:
             return []
         try:
-            rows = await store.list_deliverable(
+            rows = await store.peek_pending(
                 scope="private", platform="", user_id="", session_id=session_id,
-                allow_cross_window=True, limit=3)
+                limit=3)
         except Exception:  # noqa: BLE001
             return []
         out: list[tuple[str, str]] = []
@@ -833,20 +844,24 @@ class CompanionBridge:
     # ------------------------------------------------------------------
 
     async def search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
-        loader = getattr(self._plugin, "load_open_loops", None)
+        loader = getattr(self._engine(), "load_open_loop_memories", None)
         if loader is None:
             return []
         try:
-            items = await loader(session_id=session_id, limit=int(limit))
+            rows = await loader(session_id=session_id or None, limit=int(limit))
         except Exception:  # noqa: BLE001
             return []
         return [
-            {"memory_id": item.memory_id, "content": item.text[:300],
-             "session_id": item.session_id, "occurred_at": item.occurred_iso,
-             "age_days": item.age_days, "open_loop_weight": item.open_loop_weight,
-             "promise_weight": item.promise_weight,
-             "memory_reason": item.reason[:200]}
-            for item in items
+            {"memory_id": row.get("memory_id"),
+             "content": str(row.get("content") or "")[:300],
+             "session_id": str(row.get("session_id") or ""),
+             "occurred_at": time.strftime(
+                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(row.get("create_time") or 0)),
+             "age_days": float(row.get("age_days") or 0.0),
+             "open_loop_weight": 0.7 if row.get("due_ts") else 0.5,
+             "promise_weight": 0.8 if row.get("promise") else 0.2,
+             "memory_reason": str(row.get("reason") or "")[:200]}
+            for row in rows
         ]
 
     def get_relationship_phase(self, *, session_id: str = "", scope: str = "private",

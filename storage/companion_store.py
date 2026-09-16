@@ -216,6 +216,8 @@ class CompanionStore:
             return key, cursor.rowcount == 0
 
     async def list_events_between(self, *, bot_id: str = "", kind: str = "",
+                                  kinds: tuple[str, ...] | None = None,
+                                  session_id: str = "",
                                   since_date: str = "", until_date: str = "",
                                   limit: int = 20) -> list[dict[str, Any]]:
         """Day-window query for fast contexts and the self-line slot."""
@@ -227,6 +229,12 @@ class CompanionStore:
         if kind:
             sql += " AND kind = ?"
             params.append(kind)
+        if kinds:
+            sql += f" AND kind IN ({','.join('?' * len(kinds))})"
+            params.extend(kinds)
+        if session_id:
+            sql += " AND session_id = ?"
+            params.append(session_id)
         if since_date:
             sql += " AND event_date >= ?"
             params.append(since_date)
@@ -434,6 +442,69 @@ class CompanionStore:
                 acked += cursor.rowcount
             await db.commit()
         return acked
+
+    async def peek_pending(self, *, bot_id: str = "", session_id: str = "",
+                           user_id: str = "", scope: str = "", platform: str = "",
+                           allow_cross_window: bool = False,
+                           limit: int = 3) -> list[dict[str, Any]]:
+        """Read undelivered afterglow WITHOUT consuming it (main-chain slot).
+
+        The delivery marking belongs to the bridge's list_emotion_events
+        (companion plugin); the injection self-line must stay read-only.
+        """
+        now = time.time()
+        sql = ("SELECT event_type, occurred_at FROM emotion_ledger "
+               "WHERE delivery_state='pending' AND (expires_at <= 0 OR expires_at > ?)")
+        params: list[Any] = [now]
+        if bot_id:
+            sql += " AND bot_id = ?"
+            params.append(bot_id)
+        if scope:
+            sql += " AND scope = ?"
+            params.append(scope)
+        if allow_cross_window and user_id:
+            sql += " AND platform = ? AND user_id = ?"
+            params.extend([platform, user_id])
+        elif session_id:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY occurred_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 10)))
+        async with self._connect() as db:
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def interaction_stats(self, *, bot_id: str = "", scope: str = "",
+                                platform: str = "", user_id: str = "",
+                                since_ts: float) -> dict[str, int]:
+        """Warm/scar event counts since a timestamp, for the relationship line."""
+        sql = ("SELECT event_type, COUNT(*) AS n FROM emotion_ledger "
+               "WHERE occurred_at >= ?")
+        params: list[Any] = [since_ts]
+        if bot_id:
+            sql += " AND bot_id = ?"
+            params.append(bot_id)
+        if scope:
+            sql += " AND scope = ?"
+            params.append(scope)
+        if platform:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " GROUP BY event_type"
+        async with self._connect() as db:
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+        counts = {str(r["event_type"]): int(r["n"]) for r in rows}
+        return {
+            "warm": counts.get("warm_memory", 0) + counts.get("praise", 0),
+            "intimate": counts.get("intimacy", 0),
+            "scar": counts.get("scar_touched", 0) + counts.get("hurt", 0),
+            "total": sum(counts.values()),
+        }
 
     async def list_undistilled_acked(self, limit: int = 50) -> list[dict[str, Any]]:
         """Acked events awaiting the weekly distillation task."""

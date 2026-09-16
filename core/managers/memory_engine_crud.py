@@ -8,17 +8,17 @@ import json
 import time
 from typing import Any
 
+import aiosqlite
+
 from astrbot.api import logger
 
+from ...storage.atom_store import AtomStore
 from ..memory_transfer import memory_import_key
 from ..processors.atom_classifier import classify_atoms
 from ..retrieval.hybrid_retriever import HybridResult
 from ..retrieval.route_execution import search_route
 from ..utils.json_utils import safe_json_dict
 from ..utils.number_utils import clamp_float, safe_float
-from ...storage.atom_store import AtomStore
-
-import aiosqlite
 
 
 class MemoryEngineCrudMixin:
@@ -1210,6 +1210,218 @@ class MemoryEngineCrudMixin:
         return await self.graph_memory_manager.rebuild_memory_batches(
             active_memory_batches()
         )
+
+    async def add_core_memory(
+        self,
+        content: str,
+        *,
+        label: str = "rule",
+        kind: str = "rule",
+        priority: int = 50,
+        scope: str = "global",
+        session_id: str | None = None,
+        persona_id: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        """Store one always-resident core memory as a CORE_MEMORY document.
+
+        Core memories live in the documents layer on purpose: atoms carry
+        TTL/expiry recomputation that conflicts with pinned residency
+        (atom_store._prepare_atom_for_insert overwrites timestamps).
+        status='core' keeps them out of every similarity index: the
+        validator and rebuild paths only touch status='active' documents,
+        and BM25/vector indexes never see them (written directly here,
+        bypassing add_memory). They load unconditionally each turn and
+        never duplicate retrieval hits.
+
+        Args:
+            content: the rule/boundary/preference text.
+            label: short name for display and management.
+            kind: rule | boundary | preference | stable_fact.
+            priority: 0-100, higher loads first under the char budget.
+            scope: global | session | persona | user — residency domain.
+            session_id/persona_id/user_id: domain keys per scope.
+
+        Returns:
+            int: documents row id.
+        """
+        if not content or not content.strip():
+            raise ValueError("记忆内容不能为空")
+        if self.db_connection is None:
+            raise RuntimeError("数据库连接未初始化")
+        now = time.time()
+        metadata = {
+            "memory_type": "CORE_MEMORY",
+            "status": "core",
+            "core_label": label[:60],
+            "core_kind": kind[:30],
+            "core_priority": max(0, min(100, int(priority))),
+            "core_scope": scope,
+            "core_session_id": session_id or "",
+            "core_persona_id": persona_id or "",
+            "core_user_id": user_id or "",
+            "importance": 0.95,
+            "create_time": now,
+        }
+        cursor = await self.db_connection.execute(
+            "INSERT INTO documents(text, metadata, created_at, updated_at) "
+            "VALUES (?, ?, datetime('now'), datetime('now'))",
+            (content.strip()[:500], json.dumps(metadata, ensure_ascii=False)),
+        )
+        await self.db_connection.commit()
+        self._invalidate_search_cache()
+        return int(cursor.lastrowid or 0)
+
+    async def load_core_memories(
+        self,
+        *,
+        session_id: str | None = None,
+        persona_id: str | None = None,
+        user_id: str | None = None,
+        max_blocks: int = 8,
+        max_chars: int = 800,
+    ) -> list[dict[str, Any]]:
+        """Load always-resident core blocks applicable to this session.
+
+        Args:
+            session_id/persona_id/user_id: residency domain of the current
+                turn; a block loads if its core_scope matches the turn.
+            max_blocks/max_chars: residency budgets.
+
+        Returns:
+            List of dicts with memory_id/label/kind/priority/text keys,
+            priority-sorted within budget.
+        """
+        try:
+            if self.db_connection is None:
+                return []
+            cursor = await self.db_connection.execute(
+                """
+                SELECT id, text, metadata
+                FROM documents
+                WHERE UPPER(COALESCE(json_extract(metadata, '$.memory_type'),
+                                     'GENERAL')) = 'CORE_MEMORY'
+                  AND COALESCE(json_extract(metadata, '$.status'), 'active') = 'core'
+                ORDER BY CAST(COALESCE(json_extract(metadata, '$.core_priority'), 50) AS REAL) DESC
+                LIMIT 64
+                """
+            )
+            rows = await cursor.fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[核心记忆] 装载查询失败: {exc}")
+            return []
+
+        blocks: list[dict[str, Any]] = []
+        used = 0
+        for row in rows:
+            if len(blocks) >= max_blocks:
+                break
+            meta = safe_json_dict(row["metadata"])
+            if meta.get("core_enabled") is False:
+                continue
+            scope = str(meta.get("core_scope") or "global")
+            if scope == "session" and session_id and \
+                    str(meta.get("core_session_id") or "") != session_id:
+                continue
+            if scope == "persona" and persona_id and \
+                    str(meta.get("core_persona_id") or "") != persona_id:
+                continue
+            if scope == "user" and user_id and \
+                    str(meta.get("core_user_id") or "") != user_id:
+                continue
+            text = str(row["text"] or "").strip()
+            if not text:
+                continue
+            if used + len(text) > max_chars:
+                continue
+            used += len(text)
+            blocks.append({
+                "memory_id": int(row["id"]),
+                "label": str(meta.get("core_label") or ""),
+                "kind": str(meta.get("core_kind") or "rule"),
+                "priority": float(meta.get("core_priority") or 50),
+                "text": text,
+            })
+        return blocks
+
+    async def load_open_loop_memories(
+        self, *, session_id: str | None = None, limit: int = 6
+    ) -> list[dict[str, Any]]:
+        """Load unfinished commitments / topics (open loops) for injection.
+
+        Open-loop marking is written by the reflection path into document
+        metadata (open_loop=1, optional due_ts, closed flag on resolution).
+
+        Returns:
+            List of dicts with memory_id/content/age_days/due_ts/promise/
+            reason keys, most urgent first.
+        """
+        now = time.time()
+        try:
+            if self.db_connection is None:
+                return []
+            sql = """
+                SELECT id, text, metadata
+                FROM documents
+                WHERE json_valid(metadata)
+                  AND COALESCE(json_extract(metadata, '$.status'), 'active') = 'active'
+                  AND COALESCE(CAST(json_extract(metadata, '$.open_loop') AS INTEGER), 0) = 1
+                  AND COALESCE(CAST(json_extract(metadata, '$.open_loop_closed') AS INTEGER), 0) = 0
+                  AND COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) >= ?
+                ORDER BY COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) DESC
+                LIMIT 32
+            """
+            cursor = await self.db_connection.execute(sql, (now - 30 * 86400,))
+            rows = await cursor.fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[未闭环] 装载查询失败: {exc}")
+            return []
+
+        now = time.time()
+        loops: list[dict[str, Any]] = []
+        for row in rows:
+            meta = safe_json_dict(row["metadata"])
+            row_session = str(meta.get("core_session_id")
+                              or meta.get("source_session_id")
+                              or meta.get("session_id") or "")
+            if session_id and row_session and row_session != session_id:
+                continue
+            create_time = float(meta.get("create_time") or row["id"] * 0 or now)
+            due_ts = float(meta.get("due_ts") or 0.0)
+            loops.append({
+                "memory_id": int(row["id"]),
+                "content": str(row["text"] or "")[:300],
+                "session_id": row_session,
+                "create_time": create_time,
+                "age_days": round(max(0.0, (now - create_time) / 86400.0), 1),
+                "due_ts": due_ts,
+                "promise": bool(meta.get("promise")),
+                "reason": str(meta.get("open_loop_reason") or "未闭环话题")[:200],
+            })
+        # Overdue-due first, then promise weight, then freshness.
+        loops.sort(key=lambda x: (
+            -(1.0 if x["due_ts"] and x["due_ts"] < now else 0.0),
+            -float(x["promise"]),
+            -x["create_time"],
+        ))
+        return loops[: max(1, min(int(limit), 12))]
+
+    async def close_open_loop(self, memory_id: int) -> bool:
+        """Mark an open loop resolved (metadata-only, no re-embedding)."""
+        if self.db_connection is None:
+            return False
+        cursor = await self.db_connection.execute(
+            """
+            UPDATE documents
+            SET metadata = json_set(metadata, '$.open_loop_closed', 1),
+                updated_at = datetime('now')
+            WHERE id = ? AND json_valid(metadata)
+            """,
+            (int(memory_id),),
+        )
+        await self.db_connection.commit()
+        self._invalidate_search_cache()
+        return cursor.rowcount > 0
 
     async def update_importance(self, memory_id: int, new_importance: float) -> bool:
         """

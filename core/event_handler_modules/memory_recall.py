@@ -4,8 +4,9 @@
 """
 
 import asyncio
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
@@ -14,6 +15,10 @@ from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
+from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
+from ..companion.composer import MemoryItem, PackageComposer
+from ..companion.gate import decide_gate, parse_time_window
+from ..companion.slots import collect_slots
 from ..memory_scope import (
     is_event_memory_allowed,
     is_suspicious_session_id,
@@ -32,6 +37,23 @@ if TYPE_CHECKING:
     from ..managers.memory_engine import MemoryEngine
     from ..utils.injection_adapter import InjectionAdapter
     from .message_utils import MessageUtils
+
+# 约定/时间敏感特征：数字、日期、车次、地点类线索
+_TIME_MARK_RE = re.compile(
+    r"(\d+\s*[点时:：]\d*|[周天日]末?|\d{1,2}月\d{1,2}[日号]|高铁|动车|航班|火车|"
+    r"明天|后天|下周|下个月|星期[一二三四五六日天]|约定|说好|答应)"
+)
+
+
+def _date_label(create_time: object) -> str:
+    """Compact YYYY-MM-DD label for a metadata create_time (epoch seconds)."""
+    try:
+        ts = float(create_time or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 class MemoryRecall:
@@ -63,6 +85,36 @@ class MemoryRecall:
         self.conversation_manager = conversation_manager
         self.message_utils = message_utils
         self.injection_adapter = injection_adapter
+
+    async def _fetch_source_quote(self, memory_id: object) -> str:
+        """Pull the user's own words for a time-sensitive memory (60-char cap).
+
+        Args:
+            memory_id: documents row id of the recalled memory.
+
+        Returns:
+            The best matching source-message snippet, or "" when no evidence
+            is attached (most memories are summaries without originals).
+        """
+        try:
+            mid = int(memory_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return ""
+        if mid <= 0:
+            return ""
+        try:
+            source_messages = await self.memory_engine.get_memory_source(mid)
+        except Exception:  # noqa: BLE001
+            return ""
+        for message in source_messages or []:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "") != "user":
+                continue
+            content = " ".join(str(message.get("content") or "").split())
+            if content and _TIME_MARK_RE.search(content):
+                return content[:60]
+        return ""
 
     @staticmethod
     def _message_timestamp_seconds(value) -> float | None:
@@ -168,6 +220,19 @@ class MemoryRecall:
                     logger.warning(f"[{session_id}] 原始用户消息为空，跳过记忆召回")
                     return
 
+                # 沉默闸门：低信息/纠错/纯反应消息不值得长期记忆注入
+                gate = decide_gate(actual_query)
+                gate_enabled = self.config_manager.get(
+                    "companion_slots.gate_enabled", True
+                )
+                if gate_enabled and not gate.retrieve:
+                    logger.info(
+                        f"[{session_id}] 闸门抑制本轮长期记忆注入 "
+                        f"(reason={gate.reason})"
+                    )
+                    return
+                state_only = gate_enabled and gate.state_only
+
                 # 获取过滤配置
                 filtering_config = self.config_manager.filtering_settings
                 use_persona_filtering = filtering_config.get(
@@ -250,12 +315,149 @@ class MemoryRecall:
                     persona_id=recall_persona_id,
                 )
 
-                if recalled_memories:
-                    logger.info(
-                        f"[{session_id}] 检索到 {len(recalled_memories)} 条记忆"
-                    )
+                # 时间窗口意图：作为提示行进包，不做硬过滤（v1 保守）
+                time_window = parse_time_window(actual_query)
 
-                    # 格式化并注入记忆
+                # 当前状态闲聊守卫：只保留近期记忆
+                if state_only:
+                    guard_hours = float(
+                        self.config_manager.get("companion_slots.state_guard_hours", 6.0)
+                    )
+                    cutoff = time.time() - max(0.5, guard_hours) * 3600
+                    fresh = []
+                    for mem in recalled_memories:
+                        try:
+                            create_time = float((mem.metadata or {}).get("create_time") or 0)
+                        except (TypeError, ValueError):
+                            create_time = 0.0
+                        if create_time >= cutoff:
+                            fresh.append(mem)
+                    if len(fresh) != len(recalled_memories):
+                        logger.info(
+                            f"[{session_id}] 状态闲聊守卫："
+                            f"{len(recalled_memories)} -> {len(fresh)} 条近期记忆"
+                        )
+                    recalled_memories = fresh
+
+                # 收集固定槽位（核心/情绪余波/关系/未闭环/今日自我）
+                deferred_sections: set[str] = set()
+                try:
+                    extra = event.get_extra(
+                        "memory_companion_companion_deferred_sections")
+                    if isinstance(extra, (set, list, tuple)):
+                        deferred_sections = {str(item) for item in extra}
+                except Exception:  # noqa: BLE001
+                    pass
+                message_count = 0
+                try:
+                    info = await self.conversation_manager.get_session_info(session_id)
+                    message_count = int(getattr(info, "message_count", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    sender_id = str(event.get_sender_id() or "")
+                except Exception:  # noqa: BLE001
+                    sender_id = ""
+                try:
+                    platform_name = str(event.get_platform_name() or "")
+                except Exception:  # noqa: BLE001
+                    platform_name = ""
+
+                slot_bundle = await collect_slots(
+                    config_manager=self.config_manager,
+                    memory_engine=self.memory_engine,
+                    companion_store=getattr(self.memory_engine, "companion_store", None),
+                    session_id=recall_session_id or session_id,
+                    persona_id=recall_persona_id,
+                    user_id=sender_id,
+                    platform=platform_name,
+                    event_extras=deferred_sections,
+                    session_message_count=message_count,
+                )
+
+                # 检索结果转为条目；时间敏感类允许原文替代转述
+                retrieval_items: list[MemoryItem] = []
+                enable_raw_quote = self.config_manager.get(
+                    "companion_slots.enable_raw_quote", True)
+                for mem in recalled_memories:
+                    text = str(getattr(mem, "content", "") or "")
+                    if enable_raw_quote and _TIME_MARK_RE.search(text):
+                        quoted = await self._fetch_source_quote(
+                            getattr(mem, "doc_id", None))
+                        if quoted:
+                            text = quoted
+                    metadata = getattr(mem, "metadata", None) or {}
+                    time_label = _date_label(metadata.get("create_time"))
+                    retrieval_items.append(MemoryItem(
+                        text=text,
+                        source=str(metadata.get("memory_type") or ""),
+                        time_label=time_label,
+                        weight=float(getattr(mem, "final_score", 0.0) or 0.0),
+                    ))
+
+                has_fixed_slots = bool(
+                    slot_bundle.core_blocks or slot_bundle.one_line_slots
+                    or slot_bundle.open_loops)
+                has_slot_content = has_fixed_slots or bool(retrieval_items)
+
+                # 先解析注入方式（含 Provider 兼容降级），决定记忆包构成
+                configured_method = self.config_manager.get(
+                    "recall_engine.injection_method", "extra_user_content"
+                )
+                provider = None
+                if configured_method in (
+                    "fake_tool_call",
+                    "fake_tool_call_deepseek_v4",
+                ):
+                    try:
+                        provider = self.context.get_using_provider(session_id)
+                    except Exception:
+                        logger.warning(
+                            f"[{session_id}] 获取当前 Provider 失败，"
+                            "将按无 Provider 继续解析注入模式: {e}"
+                        )
+                injection_method, fallback_reason = (
+                    self.injection_adapter.resolve(provider, configured_method)
+                )
+                if fallback_reason:
+                    logger.warning(
+                        f"[{session_id}] 注入模式从 {configured_method} 降级为 "
+                        f"{injection_method}: {fallback_reason}"
+                    )
+                retrieval_via_tool = injection_method == "fake_tool_call"
+
+                memory_str = ""
+                package_used = False
+                if has_slot_content and self.config_manager.get(
+                        "companion_slots.enable_package", True):
+                    composer = PackageComposer(
+                        budget_chars=int(self.config_manager.get(
+                            "companion_slots.budget_chars", 1000)),
+                        core_budget_chars=min(600, int(self.config_manager.get(
+                            "core_memory.max_chars", 800))),
+                    )
+                    one_lines = list(slot_bundle.one_line_slots)
+                    if time_window.active and time_window.label:
+                        one_lines.insert(0, ("time_window",
+                                             f"时间窗口：{time_window.label}"))
+                    package = composer.compose(
+                        core_blocks=slot_bundle.core_blocks,
+                        one_line_slots=one_lines,
+                        open_loops=slot_bundle.open_loops,
+                        # fake_tool_call 模式下检索结果走工具消息，包内仅固定槽位
+                        retrieval_items=([] if retrieval_via_tool else retrieval_items),
+                        current_message=actual_query[:280],
+                        suppress_empty_hint=retrieval_via_tool,
+                    )
+                    memory_str = composer.wrap_for_mainchain(package)
+                    package_used = bool(memory_str)
+                    if package.dropped_count:
+                        logger.info(
+                            f"[{session_id}] 记忆装箱：丢弃 {package.dropped_count} 条"
+                            f"（预算 {composer.budget_chars} 字）")
+
+                if not package_used and recalled_memories:
+                    # 兼容路径：打包关闭时维持旧版注入格式
                     memory_list = [
                         {
                             "id": getattr(mem, "doc_id", None),
@@ -266,53 +468,40 @@ class MemoryRecall:
                         }
                         for mem in recalled_memories
                     ]
-
-                    # 输出详细记忆信息
-                    for i, mem in enumerate(recalled_memories, 1):
-                        logger.debug(
-                            f"[{session_id}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
-                            f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
-                            f"内容={mem.content[:100]}..."
-                        )
-
-                    # 根据配置选择注入方式（含 Provider 兼容降级）
-                    configured_method = self.config_manager.get(
-                        "recall_engine.injection_method", "extra_user_content"
-                    )
-                    provider = None
-                    if configured_method in (
-                        "fake_tool_call",
-                        "fake_tool_call_deepseek_v4",
-                    ):
-                        try:
-                            provider = self.context.get_using_provider(session_id)
-                        except Exception as e:
-                            logger.warning(
-                                f"[{session_id}] 获取当前 Provider 失败，"
-                                f"将按无 Provider 继续解析注入模式: {e}"
-                            )
-                    injection_method, fallback_reason = (
-                        self.injection_adapter.resolve(provider, configured_method)
-                    )
-                    if fallback_reason:
-                        logger.warning(
-                            f"[{session_id}] 注入模式从 {configured_method} 降级为 "
-                            f"{injection_method}: {fallback_reason}"
-                        )
-
                     memory_str = format_memories_for_injection(memory_list)
 
+                # 输出详细记忆信息
+                for i, mem in enumerate(recalled_memories, 1):
+                    logger.debug(
+                        f"[{session_id}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
+                        f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
+                        f"内容={mem.content[:100]}..."
+                    )
+
+                if memory_str or recalled_memories:
                     if injection_method == "user_message_before":
-                        req.prompt = memory_str + "\n\n" + (req.prompt or "")
-                        logger.info(
-                            f"[{session_id}] 成功向用户消息前注入 {len(recalled_memories)} 条记忆"
-                        )
+                        if memory_str:
+                            req.prompt = memory_str + "\n\n" + (req.prompt or "")
+                            logger.info(
+                                f"[{session_id}] 成功向用户消息前注入记忆包"
+                            )
                     elif injection_method == "user_message_after":
-                        req.prompt = (req.prompt or "") + "\n\n" + memory_str
-                        logger.info(
-                            f"[{session_id}] 成功向用户消息后注入 {len(recalled_memories)} 条记忆"
-                        )
+                        if memory_str:
+                            req.prompt = (req.prompt or "") + "\n\n" + memory_str
+                            logger.info(
+                                f"[{session_id}] 成功向用户消息后注入记忆包"
+                            )
                     elif injection_method == "fake_tool_call":
+                        memory_list = [
+                            {
+                                "id": getattr(mem, "doc_id", None),
+                                "content": mem.content,
+                                "score": mem.final_score,
+                                "metadata": mem.metadata,
+                                "timestamp": mem.metadata.get("create_time"),
+                            }
+                            for mem in recalled_memories
+                        ]
                         fake_messages = format_memories_for_fake_tool_call(
                             memory_list,
                             query=actual_query,
@@ -326,16 +515,29 @@ class MemoryRecall:
                                 f"[{session_id}] 成功以伪造工具调用方式注入 "
                                 f"{len(recalled_memories)} 条记忆"
                             )
+                        if package_used and has_fixed_slots:
+                            # 固定槽位无法表达为工具调用结果，单独临时片段附加
+                            req.extra_user_content_parts.append(
+                                TextPart(text=memory_str).mark_as_temp()
+                            )
+                            logger.info(
+                                f"[{session_id}] 已向用户消息末尾附加固定槽位"
+                                f"（核心块 {len(slot_bundle.core_blocks)} 个，"
+                                f"提示行 {len(slot_bundle.one_line_slots)} 个）"
+                            )
                     else:
                         # extra_user_content（推荐）：追加到用户消息末尾，
                         # 不影响前缀缓存且 mark_as_temp 后不污染对话历史
-                        req.extra_user_content_parts.append(
-                            TextPart(text=memory_str).mark_as_temp()
-                        )
-                        logger.info(
-                            f"[{session_id}] 成功向用户消息末尾注入 "
-                            f"{len(recalled_memories)} 条记忆"
-                        )
+                        if memory_str:
+                            req.extra_user_content_parts.append(
+                                TextPart(text=memory_str).mark_as_temp()
+                            )
+                            logger.info(
+                                f"[{session_id}] 成功向用户消息末尾注入记忆包"
+                                f"（检索 {len(recalled_memories)} 条"
+                                f"，固定槽位 {len(slot_bundle.one_line_slots)} 个"
+                                f"，核心块 {len(slot_bundle.core_blocks)} 个）"
+                            )
                 else:
                     logger.info(f"[{session_id}] 未找到相关记忆")
 
@@ -349,7 +551,6 @@ class MemoryRecall:
     ) -> int:
         """从请求上下文中移除临时注入的记忆片段"""
         import re
-        from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
 
         removed = 0
 
@@ -389,7 +590,6 @@ class MemoryRecall:
 
     def _is_livingmemory_temp_part(self, part) -> bool:
         """判断是否为 LivingMemory 本轮临时注入的 extra_user_content part"""
-        from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
 
         text = getattr(part, "text", "")
         return (
