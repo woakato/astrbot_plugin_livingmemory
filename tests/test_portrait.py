@@ -229,6 +229,29 @@ async def test_batch_requires_distinct_statements(tmp_path: Path):
     assert any(i["epistemic_status"] == "inferred" for i in read["items"])
 
 
+@pytest.mark.asyncio
+async def test_batch_attempt_cap_survives_failures(tmp_path: Path):
+    """Failed (insufficient-evidence) runs still consume the attempt budget."""
+    service, _ = await _service(tmp_path, min_independent_evidence=9)
+    await _feed(
+        service,
+        service.store,
+        [
+            "我喜欢抹茶拿铁",
+            "我超喜欢抹茶拿铁",
+            "我最爱抹茶拿铁",
+        ],
+    )
+    day = "2026-09-16"
+    out1 = await service.run_daily_batch(PERSON_ID, run_day=day)
+    assert out1["ok"] is False and out1["code"] == "portrait_insufficient_evidence"
+    out2 = await service.run_daily_batch(PERSON_ID, run_day=day)
+    assert out2["ok"] is False
+    # attempts reached 2 (default attempt_limit): third pass is capped out.
+    out3 = await service.run_daily_batch(PERSON_ID, run_day=day)
+    assert out3["code"] == "portrait_daily_limit"
+
+
 def _portrait_request() -> dict:
     person_ref = {
         "person_id": PERSON_ID,
@@ -308,6 +331,30 @@ async def test_suppression_blocks_write_and_read(tmp_path: Path):
     result = await service.read_summary(_portrait_request(), limit=8)
     assert result["ok"] is True
     assert all("抹茶拿铁" not in i["summary"] for i in result["items"])
+    # ...and the write path must refuse re-upserting it (MC gate parity).
+    from astrbot_plugin_livingmemory.core.companion.portrait_rules import (
+        normalized_claim_hash,
+    )
+
+    write = await store.upsert_fact(
+        {
+            "person_id": PERSON_ID,
+            "dimension": row["dimension"],
+            "normalized_claim_hash": row["normalized_claim_hash"],
+            "claim_summary": "喜欢 抹茶拿铁",
+            "portrait_tier": "base",
+            "source_scope": row["source_scope"],
+            "confidence": 1.0,
+            "status": "active",
+            "sensitivity": "low",
+            "evidence_hashes": [_stmt_hash("我喜欢抹茶拿铁")],
+        }
+    )
+    assert write["ok"] is False and write["code"] == "portrait_suppressed"
+    assert (
+        normalized_claim_hash("preference", "like:抹茶拿铁")
+        == row["normalized_claim_hash"]
+    )
 
 
 @pytest.mark.asyncio
@@ -320,10 +367,50 @@ async def test_single_value_dimension_supersedes_previous(tmp_path: Path):
     await service.capture_user_message(
         text="叫我小李", session_id="s1", message_id="m2", scope="private", event=event
     )
+    # Row-state truth, not just read-membership: old claim superseded, new
+    # active, with the back-pointer wired.
+    async with store._connect() as db:
+        async with db.execute(
+            "SELECT id, claim_summary, status, supersedes_id FROM portrait_facts "
+            "WHERE dimension='preferred_address'"
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+    old = next(r for r in rows if "王" in r["claim_summary"])
+    new = next(r for r in rows if "李" in r["claim_summary"])
+    assert old["status"] == "superseded"
+    assert new["status"] == "active"
+    # MC write semantics: the retired row's supersedes_id points at the
+    # replacement fact.
+    assert old["supersedes_id"] == new["id"]
+    assert new["supersedes_id"] == ""
     result = await service.read_summary(_portrait_request(), limit=8)
     addr = [i for i in result["items"] if i["dimension"] == "preferred_address"]
-    assert len(addr) == 1
-    assert "小李" in addr[0]["summary"] or "李" in addr[0]["summary"]
+    assert len(addr) == 1 and "李" in addr[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_group_scope_capture_and_read(tmp_path: Path):
+    service, _ = await _service(tmp_path)
+    event = _Event(_dto())
+    group_scope = "group:aiocqhttp:98765"
+    result = await service.capture_user_message(
+        text="我喜欢看老电影",
+        session_id="g1",
+        message_id="gm1",
+        scope=group_scope,
+        event=event,
+    )
+    assert result["ok"] is True and result["facts"] == 1
+    # Reads from the same group scope see it...
+    req = _portrait_request()
+    req["scope"] = group_scope
+    read = await service.read_summary(req, limit=8)
+    assert any("老电影" in i["summary"] for i in read["items"])
+    # ...while a private-scope read must NOT (source_only facts stay put:
+    # movie preference is deny-free but communication/venue markers aside,
+    # the fact's usable_scope governs).
+    private_read = await service.read_summary(_portrait_request(), limit=8)
+    assert all("老电影" not in i["summary"] for i in private_read["items"])
 
 
 @pytest.mark.asyncio
@@ -349,7 +436,16 @@ async def test_usage_disabled_returns_honest_code(tmp_path: Path):
     await service.sync_profile_context(event=ev_off, legacy_scope="private")
     result = await service.read_summary(req, limit=8)
     assert result["ok"] is False
-    assert result["code"] in {"portrait_usage_disabled", "bridge_stale_revision"}
+    # With the matching (revision-2) person_ref the fence passes, so the
+    # only honest outcome is usage disabled; bridge_stale_revision here
+    # would mean the fence or the capability projection broke.
+    assert result["code"] == "portrait_usage_disabled"
+    # And the stale fence itself: the same read with revision 1 must be
+    # refused as stale, proving the fence is real, not absent.
+    stale = _portrait_request()
+    stale_result = await service.read_summary(stale, limit=8)
+    assert stale_result["ok"] is False
+    assert stale_result["code"] == "bridge_stale_revision"
 
 
 # ----------------------------------------------------------------------
@@ -363,9 +459,12 @@ async def test_bridge_portrait_degrades_without_service():
     from astrbot_plugin_livingmemory.core.companion.bridge import CompanionBridge
 
     class _Host:
+        enabled = True
+
         class _CM:
             @staticmethod
             def get(key, default=None):
+                # only the bridge master switch reads with default True
                 return default
 
         config_manager = _CM()
@@ -387,11 +486,46 @@ async def test_bridge_portrait_degrades_without_service():
     assert status["code"] == "bridge_unavailable" and status["ok"] is False
     batch = await bridge.run_unified_profile_portrait_batch("person_x")
     assert batch["code"] == "bridge_unavailable"
+    # A deactivated bridge must answer the same honest shapes.
+    bridge.deactivate()
+    result = await bridge.read_unified_profile_portrait({}, limit=5)
+    assert result["code"] == "bridge_unavailable"
+
+    # ...and with the config switch off (enabled default false on this host).
+    class _DisabledHost(_Host):
+        class _CM:
+            @staticmethod
+            def get(key, default=None):
+                return False if key == "companion_bridge.enabled" else default
+
+        config_manager = _CM()
+
+    disabled = CompanionBridge(_DisabledHost())
+    result = await disabled.read_unified_profile_portrait({}, limit=5)
+    assert result == {
+        "ok": False,
+        "read_only": True,
+        "code": "bridge_unavailable",
+        "items": [],
+    }
+    assert (await disabled.run_unified_profile_portrait_batch("person_x"))[
+        "code"
+    ] == "bridge_unavailable"
+
+
+def _load_contract_module(path: Path, name: str):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_contract_fingerprint_matches_companion_copy():
-    # PC ships its own copy; the fork's contract fingerprint must equal it
-    # or every portrait request would be rejected with fingerprint_mismatch.
+    # PC ships its own contract copy; both sides compare the COMPUTED
+    # fingerprint values (PC rejects requests whose contract_fingerprint
+    # differs), so load PC's module and recompute independently.
     pc_path = (
         Path(__file__).resolve().parents[2]
         / "astrbot_plugin_private_companion"
@@ -399,15 +533,33 @@ def test_contract_fingerprint_matches_companion_copy():
     )
     if not pc_path.exists():
         pytest.skip("companion plugin not installed in this environment")
-    pc_source = pc_path.read_text(encoding="utf-8")
-    fork_source = (
-        Path(__file__).resolve().parents[1]
-        / "core/companion/contracts/unified_profile_contract.py"
-    ).read_text(encoding="utf-8")
-    pc_fp = contract.CONTRACT_FINGERPRINT  # same constants source on both sides
-    assert "CONTRACT_NAME" in pc_source
-    assert pc_fp == "72067a45012a0588", "portrait contract fingerprint drifted"
-    assert fork_source  # imported module == this file
+    pc_contract = _load_contract_module(pc_path, "pc_unified_profile_contract")
+    assert pc_contract.CONTRACT_FINGERPRINT == contract.CONTRACT_FINGERPRINT, (
+        "portrait contract fingerprint drifted from the companion plugin's copy"
+    )
+    # self_check recomputes from the shipped constants: catches any local edit.
+    assert pc_contract.contract_self_check() == []
+    assert contract.contract_self_check() == []
+    # PC's strict validator must reject its own namespace_context injection...
+    req = contract.build_portrait_request(
+        person_ref={
+            "person_id": PERSON_ID,
+            "resolved_identity_key": IDENTITY_KEY,
+            "projection_revision": 1,
+            "identity_assurance": "verified",
+            "profile_status": "active",
+        },
+        requester_person_id=PERSON_ID,
+        target_person_id=PERSON_ID,
+        scope="private",
+        purpose="summarize_to_subject",
+    )
+    req["namespace_context"] = {"persona_id": "p"}
+    assert "portrait_request_fields_invalid" in pc_contract.validate_portrait_request(
+        dict(req)
+    ), "PC validator unexpectedly permissive"
+    # ...while the fork's (MC-copy) validator accepts the PC-produced shape.
+    assert contract.validate_portrait_request(dict(req)) == []
 
 
 def test_access_decision_matrix():
@@ -419,3 +571,73 @@ def test_access_decision_matrix():
     decision = portrait_access_decision(req)
     assert decision["candidates_allowed"] is False
     assert decision["code"] == "bridge_person_mismatch"
+
+
+# ----------------------------------------------------------------------
+# maintenance-scheduler robustness (audit A3)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scheduler_isolates_per_person_batch_failures(tmp_path: Path):
+    """One raising person must not abort the pass for the rest (FIFO head
+    starvation guard): later people still get their batch attempt."""
+    from astrbot_plugin_livingmemory.core.managers.memory_engine import MemoryEngine
+    from astrbot_plugin_livingmemory.core.schedulers.companion_maintenance_scheduler import (  # noqa: E501
+        CompanionMaintenanceScheduler,
+    )
+
+    from tests.test_graph_memory import _FakeFaissDB
+
+    engine = MemoryEngine(
+        db_path=str(tmp_path / "m.db"), faiss_db=_FakeFaissDB(), config={}
+    )
+    await engine.initialize()
+    try:
+        service, store = await _service(tmp_path)
+        engine.portrait_store = store
+        engine.portrait_service = service
+        # Two pending people...
+        await _feed(service, store, ["我喜欢抹茶拿铁"])
+        other = "person_" + hashlib.sha1(b"other").hexdigest()[:24]
+        await store.upsert_person_projection(
+            {
+                "person_id": other,
+                "resolved_identity_key": "chat-origin-v1:"
+                + hashlib.sha256(b"o").hexdigest(),
+                "projection_revision": 1,
+                "identity_assurance": "verified",
+                "profile_status": "active",
+            },
+            {
+                "private_companion_enabled": True,
+                "proactive_private_enabled": True,
+                "portrait_mode": "learn_and_use",
+                "grant_source": "user_consent",
+            },
+        )
+        await store.enqueue_learning(
+            person_id=other, fact_id="missing-fact", evidence_hash=_stmt_hash("x")
+        )
+        calls: list[str] = []
+
+        class _FlakyService:
+            def __init__(self, inner):
+                self._inner = inner
+
+            async def run_daily_batch(self, person_id, *, run_day=""):
+                calls.append(person_id)
+                if person_id == calls[0]:
+                    raise RuntimeError("simulated db failure")
+                return await self._inner.run_daily_batch(person_id, run_day=run_day)
+
+            async def status(self, person_id):
+                return await self._inner.status(person_id)
+
+        engine.portrait_service = _FlakyService(service)
+        scheduler = CompanionMaintenanceScheduler(memory_engine=engine)
+        result = await scheduler._run_portrait_batches()
+        assert len(calls) == 2, f"both pending people must be attempted: {calls}"
+        assert isinstance(result, int)
+    finally:
+        await engine.close()

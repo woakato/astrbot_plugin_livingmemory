@@ -148,7 +148,9 @@ class CompanionMaintenanceScheduler:
         Goes through the portrait service so configured thresholds apply
         (the batch itself is pure distinct-evidence counting, no LLM);
         per-person daily attempt/success caps make repeated calls cheap.
-        Returns promoted-fact count.
+        One person's failure must not abort the pass for the rest (their
+        queue row never advances, so a persistently raising head would
+        starve everyone else). Returns promoted-fact count.
         """
         portrait_store = getattr(self.memory_engine, "portrait_store", None)
         service = getattr(self.memory_engine, "portrait_service", None)
@@ -157,9 +159,13 @@ class CompanionMaintenanceScheduler:
         people = await portrait_store.list_pending_people(limit=50)
         promoted = 0
         for person_id in people:
-            outcome = await service.run_daily_batch(
-                person_id, run_day=datetime.now().strftime("%Y-%m-%d")
-            )
+            try:
+                outcome = await service.run_daily_batch(
+                    person_id, run_day=datetime.now().strftime("%Y-%m-%d")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[陪伴维护] 画像批处理失败({person_id[-12:]}): {exc}")
+                continue
             if outcome.get("created"):
                 promoted += int(outcome.get("created") or 0)
         return promoted

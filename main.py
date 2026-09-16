@@ -201,8 +201,22 @@ class LivingMemoryPlugin(Star):
     # ------------------------------------------------------------------
 
     def spawn_companion_background(self, coro) -> asyncio.Task:
-        """Run a bridge write off the request path as a tracked task."""
-        return self._create_tracked_task(coro)
+        """Run a bridge write off the request path as a tracked task.
+
+        Unretrieved coroutine exceptions would otherwise surface only as
+        asyncio noise; log them at debug level with the failing call site.
+        """
+
+        def _log_exception(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.debug(f"[companion] 后台任务异常: {exc}", exc_info=exc)
+
+        task = self._create_tracked_task(coro)
+        task.add_done_callback(_log_exception)
+        return task
 
     def get_companion_token_usage(self) -> dict[str, Any]:
         """Per-purpose LLM/embedding usage counters for the bridge report."""

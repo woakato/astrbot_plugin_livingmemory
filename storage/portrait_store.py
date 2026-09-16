@@ -23,6 +23,12 @@ privacy contract with the companion plugin):
   disabled capability, suppression, confidence floor, 90-day inferred
   freshness, and scope allowlist each independently reject a row.
 
+Suppression rows are enforced by every write/read path, but note the
+end-user denial flow (MC's governance API) is not wired in this fork v1:
+in practice suppressions stay empty unless written internally (spec §13.4).
+MC-only administration tables (portrait_operations, profile_repair_operations)
+are intentionally absent with their unported surfaces.
+
 Follows CompanionStore's short-connection pattern (WAL + busy_timeout).
 """
 
@@ -214,8 +220,12 @@ class PortraitStore:
                     updated_at TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(person_id, run_day)
                 );
-                CREATE INDEX IF NOT EXISTS idx_pf_person ON portrait_facts(person_id, status);
-                CREATE INDEX IF NOT EXISTS idx_pq_person_state ON portrait_learning_queue(person_id, state);
+                CREATE INDEX IF NOT EXISTS idx_portrait_evidence_person ON portrait_evidence(person_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_portrait_facts_person ON portrait_facts(person_id, status, sensitivity, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_portrait_scope_capabilities_person ON portrait_scope_capabilities(person_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_portrait_suppressions_person ON portrait_suppressions(person_id, status);
+                CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_person ON portrait_learning_queue(person_id, state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_fact ON portrait_learning_queue(fact_id, state);
                 """
             )
             await db.commit()
@@ -845,9 +855,34 @@ class PortraitStore:
         min_independent_evidence: int = 3,
         success_limit: int = 1,
         attempt_limit: int = 2,
-        # upsert_fact takes the same write lock, so the batch runs on a
-        # separate connection and relies on BEGIN IMMEDIATE + busy_timeout.
     ) -> dict[str, Any]:
+        """Nightly promotion for one person (MC _run_portrait_daily_batch_sync).
+
+        Cap check, attempt record and promotion form one critical section:
+        asyncio.Lock is not reentrant, so the body calls the *_locked
+        helpers directly. A second concurrent batch must never pass the
+        per-day caps on pre-promotion counters (MC holds its lock across
+        the same span).
+        """
+        async with self._write_lock:
+            return await self._run_daily_batch_locked(
+                person_id=person_id,
+                run_day=run_day,
+                min_independent_evidence=min_independent_evidence,
+                success_limit=success_limit,
+                attempt_limit=attempt_limit,
+            )
+
+    async def _run_daily_batch_locked(
+        self,
+        *,
+        person_id: str,
+        run_day: str,
+        min_independent_evidence: int = 3,
+        success_limit: int = 1,
+        attempt_limit: int = 2,
+    ) -> dict[str, Any]:
+        """Batch body; the caller must hold _write_lock."""
         person_id = _clean_text(person_id, 80)
         run_day = _clean_text(run_day, 16)
         if not person_id or not _DAY_RE.fullmatch(run_day):
@@ -981,7 +1016,9 @@ class PortraitStore:
                     "context_refs": _json_loads(row["context_refs"], []),
                     "operation_id": f"portrait.daily:{person_id[-12:]}:{run_day}",
                 }
-                result = await self.upsert_fact(inferred)
+                # _write_lock is already held by run_daily_batch (not
+                # reentrant), so the locked variant is called directly.
+                result = await self._upsert_fact_locked(inferred)
                 if result.get("ok"):
                     async with self._connect() as db2:
                         await db2.execute(

@@ -13,7 +13,7 @@ Spec: docs/companion-fork-spec.md section 13.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from .contracts import unified_profile_contract as contract
@@ -318,7 +318,9 @@ class PortraitService:
     ) -> dict[str, Any]:
         day = str(run_day or "")[:16]
         if not day:
-            day = datetime.now(timezone.utc).astimezone().date().isoformat()
+            # Local calendar day: portrait_daily_runs keys and the nightly
+            # scheduler both use the operator's wall clock (see A5 audit).
+            day = datetime.now().date().isoformat()
         return await self.store.run_daily_batch(
             person_id=str(person_id or "")[:80],
             run_day=day,
@@ -330,14 +332,19 @@ class PortraitService:
         )
 
     # ------------------------------------------------------------------
-    # namespace decision — MC-equivalent for the legacy path.
+    # namespace decision — legacy scope always.
     #
-    # The REQ-041 exact-match branch (digest scopes) is intentionally not
-    # ported: this fork does not implement the namespace producer surface,
-    # so an attested namespace must degrade to the legacy scope bucket
-    # rather than reject every capture (MC itself supports namespace-less
-    # operation via "portrait_namespace_legacy"). When REQ-041 lands here
-    # with the scoped-erase surface, revisit this gate wholesale.
+    # MC's counterpart resolves an attested NamespaceContext to a digest
+    # scope (portrait_namespace_exact) and only falls back to legacy when
+    # no namespace is present. The exact branch is intentionally not
+    # ported here: PC only attaches namespace_context after the namespace
+    # migration epoch binds successfully against the memory bridge
+    # (bind_namespace_migration_epoch), which this fork does not implement
+    # — so in a fork deployment the value is unreachable and capture/read
+    # both stay in the same legacy bucket, self-consistently. If REQ-041
+    # lands later, this gate must be re-ported wholesale, and note that
+    # data captured under the fork's "private" bucket would be invisible
+    # to MC's digest-scoped reads (and vice versa) after a plugin swap.
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -420,6 +427,10 @@ def spawn_portrait_capture(
     """
     if plugin is None or service is None:
         return
+    # fork addition vs MC: MC captures every non-command message; this
+    # filter drops texts shorter than 4 chars (first-person claims below
+    # that length are vanishingly rare; keeps per-turn overhead off hot
+    # paths). Documented in spec §13.4.
     if not text or text.startswith("/") or len(text) < 4 or not scope:
         return
     message_id = ""

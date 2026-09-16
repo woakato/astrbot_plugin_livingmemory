@@ -276,7 +276,22 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 ### 13.4 已知降级面（v1 刻意不做）
 
 - 群聊未唤醒消息不做画像采集（原因见 13.1.4；需要画像的群场景建议用唤醒轮即可）。
-- 不做画像管理页 / 治理面（suppress/revoke 仅经内部接口，PC 管理页的画像面板走 read 方法不受影响）。
+- 不做画像管理页 / 治理面（suppress/revoke 仅经内部接口，PC 管理页的画像面板走 read 方法不受影响）。**注意接线缺口**：store 层压制读写门完整可用且有测试，但没有任何终端用户入口会写入压制行（MC 的治理 API 未移植）——即"用户否认"目前只能内部产生，对外不承诺该隐私控制。
 - `get_relationship_phase` 维持 unknown 诚实形状；`consume_relationship_projection` 不实现——PC 侧用 `callable()` 探针守护（memory_companion_adapter.py:2497），缺方法即静默跳过，已核实无 TypeError 路径。
-- REQ-041 命名空间精确隔离（digest 分桶）未移植；将来实现 scoped-erase 面时一并重审 `_namespace_decision`。
+- REQ-041 命名空间精确隔离（digest 分桶）未移植；PC 只有在向记忆桥绑定命名空间迁移纪元（`bind_namespace_migration_epoch`，fork 未实现）后才会随请求附 `namespace_context`，所以 fork 部署里该值不可达、采集/读取恒在同一 legacy 桶内自洽。若日后换回 MC 接管，旧桶数据互不可见（`private` vs `private@<personaDigest>@<scopeDigest>`），需迁移。
+- 采集过滤器 `len(text)<4` 与命令前缀跳过是 fork 新增（MC 无长度门）：4 字以内第一人称声明极少（如"叫我X"3字），换取每轮热路径零开销。3 字称呼句"叫我李"会被丢弃。
+
+### 13.5 画像审计轮（双路子代理验收，2026-09-17）
+
+移植保真度审计结论：规则/存储/读门与 MC 逐条语义一致（AST 归一 diff 0 差异；profile_quality、sensitive_data、unified_profile_contract 三件字节级一致），无 P0/P1。修复项：
+
+- [x] F-01 `run_daily_batch` 的"检查日限额→ promote → 记账"改为整体持 `_write_lock` 的 `_run_daily_batch_locked`（MC 同区间持 RLock），消除并发批量双通过的 TOCTOU；批体内 upsert 改走 `_upsert_fact_locked` 防重入死锁。
+- [x] A3 维护调度器逐人 try/except：单人的批量异常不再中断其余 49 人（防队头饿死），计数继续。
+- [x] F-06 补齐 MC 的 6 个画像二级索引（evidence/facts/suppressions/scope_caps/queue×2）。
+- [x] A8 `spawn_companion_background` 加 done-callback 记录后台协程异常（debug 级），画像/桥写失败不再静默。
+- [x] F-07 store 头部说明修正：压制面"有门无入口"如实标注；8 表改 7 表并说明 MC 两张管理表随未移植面省略。
+- [x] F-04 `_namespace_decision` 注释更正：写明 MC 在带上下文时会走 exact 桶而 fork 恒 legacy，以及为何部署中不可达、换回 MC 时的桶分裂后果。
+- [x] A5 `run_daily_batch` 缺省日改用 `datetime.now().date()`（与调度器同用本地日历日；原 UTC.astimezone 写法正确但误导）。
+- [x] F-08 测试强化：指纹测试改为**加载 PC 模块重算比对**（并用双方校验器对同一 namespace_context 请求做对照断言）；supersede 断言行状态与 supersedes_id 回指；usage-disabled 精确化并新增 stale fence 对照；压制面补"写拒绝"断言；新增 attempt-cap、群作用域隔离、调度器逐人容错 3 例（15 例全绿）。
+
 
