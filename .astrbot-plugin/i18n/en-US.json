@@ -543,6 +543,14 @@
       "enable_raw_quote": {
         "description": "Important original quote",
         "hint": "For commitment-type memories allow one 60-char original quote instead of paraphrase."
+      },
+      "enable_package": {
+        "description": "Memory package mode",
+        "hint": "When off, fall back to the legacy per-item injection format (for compatibility troubleshooting)."
+      },
+      "state_guard_hours": {
+        "description": "State-chat time window",
+        "hint": "Current-state chat keeps only recent memories within this many hours."
       }
     }
   }

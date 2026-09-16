@@ -38,10 +38,13 @@ if TYPE_CHECKING:
     from ..utils.injection_adapter import InjectionAdapter
     from .message_utils import MessageUtils
 
-# 约定/时间敏感特征：数字、日期、车次、地点类线索
+# 约定/时间敏感特征：数字、日期、车次、地点类线索。
+# 注意保持精确：[周天日] 裸字会命中"今天天气好"这类无时间信息的句子，
+# 因此只允许带前缀/后缀的完整时间词。
 _TIME_MARK_RE = re.compile(
-    r"(\d+\s*[点时:：]\d*|[周天日]末?|\d{1,2}月\d{1,2}[日号]|高铁|动车|航班|火车|"
-    r"明天|后天|下周|下个月|星期[一二三四五六日天]|约定|说好|答应)"
+    r"(\d+\s*[点时:：]\d*|周末|周[一二三四五六日]|下周|下星期|下个月|明天|明日|后天|"
+    r"\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号]|星期[一二三四五六日天]|高铁|动车|航班|火车|"
+    r"约定|说好|答应|别忘了)"
 )
 
 
@@ -140,9 +143,7 @@ class MemoryRecall:
             timestamp /= 1000.0
         return timestamp if timestamp > 0 else None
 
-    async def handle_memory_recall(
-        self, event: AstrMessageEvent, req: ProviderRequest
-    ):
+    async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
         """Query and inject long-term memory before LLM request"""
         try:
             if not is_event_memory_allowed(self.config_manager, event):
@@ -171,7 +172,9 @@ class MemoryRecall:
 
                 normalized = self._normalize_text_only_context_parts(req, session_id)
                 if normalized > 0:
-                    logger.info(f"[{session_id}] 已归一化 {normalized} 条纯文本历史消息")
+                    logger.info(
+                        f"[{session_id}] 已归一化 {normalized} 条纯文本历史消息"
+                    )
 
                 # 自动删除旧的注入记忆
                 if self.config_manager.get("recall_engine.auto_remove_injected", True):
@@ -249,9 +252,9 @@ class MemoryRecall:
 
                 # 作用域解析失败时回退到原始会话，与写入侧（反思/总结/工具）
                 # 保持一致，确保召回与写入面向同一批会话标记的数据
-                recall_session_id = resolve_memory_scope(
-                    self.config_manager, event
-                ) or session_id
+                recall_session_id = (
+                    resolve_memory_scope(self.config_manager, event) or session_id
+                )
                 recall_persona_id = persona_id if use_persona_filtering else None
 
                 # 使用原始用户输入作为召回关键字
@@ -262,12 +265,10 @@ class MemoryRecall:
                     "recall_engine.inject_with_recent_context", False
                 ):
                     try:
-                        recent_messages = (
-                            await self.conversation_manager.get_context(
-                                session_id,
-                                max_messages=5,
-                                format_for_llm=False,
-                            )
+                        recent_messages = await self.conversation_manager.get_context(
+                            session_id,
+                            max_messages=5,
+                            format_for_llm=False,
                         )
                         if recent_messages and len(recent_messages) > 1:
                             # recent_messages 按 timestamp DESC 排列（最新在前）
@@ -321,13 +322,17 @@ class MemoryRecall:
                 # 当前状态闲聊守卫：只保留近期记忆
                 if state_only:
                     guard_hours = float(
-                        self.config_manager.get("companion_slots.state_guard_hours", 6.0)
+                        self.config_manager.get(
+                            "companion_slots.state_guard_hours", 6.0
+                        )
                     )
                     cutoff = time.time() - max(0.5, guard_hours) * 3600
                     fresh = []
                     for mem in recalled_memories:
                         try:
-                            create_time = float((mem.metadata or {}).get("create_time") or 0)
+                            create_time = float(
+                                (mem.metadata or {}).get("create_time") or 0
+                            )
                         except (TypeError, ValueError):
                             create_time = 0.0
                         if create_time >= cutoff:
@@ -342,28 +347,36 @@ class MemoryRecall:
                 # 未闭环消解：用户本轮亲口提到该话题 = 事已谈过/已有结果
                 try:
                     resolver = getattr(
-                        self.memory_engine, "resolve_open_loops_by_text", None)
+                        self.memory_engine, "resolve_open_loops_by_text", None
+                    )
                     if resolver is not None and self.config_manager.get(
-                            "companion_slots.enable_open_loops", True):
+                        "companion_slots.enable_open_loops", True
+                    ):
                         closed = await resolver(
                             session_id=recall_session_id or session_id,
-                            user_text=actual_query)
+                            user_text=actual_query,
+                        )
                         if closed:
-                            logger.info(
-                                f"[{session_id}] 未闭环消解: {closed}")
+                            logger.info(f"[{session_id}] 未闭环消解: {closed}")
                 except Exception as resolve_exc:  # noqa: BLE001
-                    logger.debug(
-                        f"[{session_id}] 未闭环消解失败: {resolve_exc}")
+                    logger.debug(f"[{session_id}] 未闭环消解失败: {resolve_exc}")
 
                 # 收集固定槽位（核心/情绪余波/关系/未闭环/今日自我）
                 deferred_sections: set[str] = set()
-                try:
-                    extra = event.get_extra(
-                        "memory_companion_companion_deferred_sections")
-                    if isinstance(extra, (set, list, tuple)):
-                        deferred_sections = {str(item) for item in extra}
-                except Exception:  # noqa: BLE001
-                    pass
+                # PC publishes the yielded set with a bare setattr on the
+                # event (and sometimes the req); get_extra is only a legacy
+                # fallback, reading it alone would never see the yield.
+                defer_key = "memory_companion_companion_deferred_sections"
+                raw_defer = getattr(event, defer_key, None) or getattr(
+                    req, defer_key, None
+                )
+                if raw_defer is None:
+                    try:
+                        raw_defer = event.get_extra(defer_key)
+                    except Exception:  # noqa: BLE001
+                        raw_defer = None
+                if isinstance(raw_defer, (set, list, tuple)):
+                    deferred_sections = {str(item) for item in raw_defer}
                 message_count = 0
                 try:
                     info = await self.conversation_manager.get_session_info(session_id)
@@ -382,7 +395,9 @@ class MemoryRecall:
                 slot_bundle = await collect_slots(
                     config_manager=self.config_manager,
                     memory_engine=self.memory_engine,
-                    companion_store=getattr(self.memory_engine, "companion_store", None),
+                    companion_store=getattr(
+                        self.memory_engine, "companion_store", None
+                    ),
                     session_id=recall_session_id or session_id,
                     persona_id=recall_persona_id,
                     user_id=sender_id,
@@ -394,26 +409,39 @@ class MemoryRecall:
                 # 检索结果转为条目；时间敏感类允许原文替代转述
                 retrieval_items: list[MemoryItem] = []
                 enable_raw_quote = self.config_manager.get(
-                    "companion_slots.enable_raw_quote", True)
+                    "companion_slots.enable_raw_quote", True
+                )
                 for mem in recalled_memories:
                     text = str(getattr(mem, "content", "") or "")
-                    if enable_raw_quote and _TIME_MARK_RE.search(text):
+                    mem_meta = getattr(mem, "metadata", None) or {}
+                    # Raw-quote replacement only makes sense when the row
+                    # actually has source messages attached; summaries
+                    # without evidence keep their own text.
+                    if (
+                        enable_raw_quote
+                        and _TIME_MARK_RE.search(text)
+                        and mem_meta.get("has_source")
+                    ):
                         quoted = await self._fetch_source_quote(
-                            getattr(mem, "doc_id", None))
+                            getattr(mem, "doc_id", None)
+                        )
                         if quoted:
                             text = quoted
-                    metadata = getattr(mem, "metadata", None) or {}
-                    time_label = _date_label(metadata.get("create_time"))
-                    retrieval_items.append(MemoryItem(
-                        text=text,
-                        source=str(metadata.get("memory_type") or ""),
-                        time_label=time_label,
-                        weight=float(getattr(mem, "final_score", 0.0) or 0.0),
-                    ))
+                    time_label = _date_label(mem_meta.get("create_time"))
+                    retrieval_items.append(
+                        MemoryItem(
+                            text=text,
+                            source=str(mem_meta.get("memory_type") or ""),
+                            time_label=time_label,
+                            weight=float(getattr(mem, "final_score", 0.0) or 0.0),
+                        )
+                    )
 
                 has_fixed_slots = bool(
-                    slot_bundle.core_blocks or slot_bundle.one_line_slots
-                    or slot_bundle.open_loops)
+                    slot_bundle.core_blocks
+                    or slot_bundle.one_line_slots
+                    or slot_bundle.open_loops
+                )
                 has_slot_content = has_fixed_slots or bool(retrieval_items)
 
                 # 先解析注入方式（含 Provider 兼容降级），决定记忆包构成
@@ -432,8 +460,8 @@ class MemoryRecall:
                             f"[{session_id}] 获取当前 Provider 失败，"
                             "将按无 Provider 继续解析注入模式: {e}"
                         )
-                injection_method, fallback_reason = (
-                    self.injection_adapter.resolve(provider, configured_method)
+                injection_method, fallback_reason = self.injection_adapter.resolve(
+                    provider, configured_method
                 )
                 if fallback_reason:
                     logger.warning(
@@ -445,17 +473,24 @@ class MemoryRecall:
                 memory_str = ""
                 package_used = False
                 if has_slot_content and self.config_manager.get(
-                        "companion_slots.enable_package", True):
+                    "companion_slots.enable_package", True
+                ):
                     composer = PackageComposer(
-                        budget_chars=int(self.config_manager.get(
-                            "companion_slots.budget_chars", 1000)),
-                        core_budget_chars=min(600, int(self.config_manager.get(
-                            "core_memory.max_chars", 800))),
+                        budget_chars=int(
+                            self.config_manager.get(
+                                "companion_slots.budget_chars", 1000
+                            )
+                        ),
+                        core_budget_chars=min(
+                            600,
+                            int(self.config_manager.get("core_memory.max_chars", 800)),
+                        ),
                     )
                     one_lines = list(slot_bundle.one_line_slots)
                     if time_window.active and time_window.label:
-                        one_lines.insert(0, ("time_window",
-                                             f"时间窗口：{time_window.label}"))
+                        one_lines.insert(
+                            0, ("time_window", f"时间窗口：{time_window.label}")
+                        )
                     package = composer.compose(
                         core_blocks=slot_bundle.core_blocks,
                         one_line_slots=one_lines,
@@ -470,7 +505,8 @@ class MemoryRecall:
                     if package.dropped_count:
                         logger.info(
                             f"[{session_id}] 记忆装箱：丢弃 {package.dropped_count} 条"
-                            f"（预算 {composer.budget_chars} 字）")
+                            f"（预算 {composer.budget_chars} 字）"
+                        )
 
                 if not package_used and recalled_memories:
                     # 兼容路径：打包关闭时维持旧版注入格式
@@ -498,15 +534,11 @@ class MemoryRecall:
                     if injection_method == "user_message_before":
                         if memory_str:
                             req.prompt = memory_str + "\n\n" + (req.prompt or "")
-                            logger.info(
-                                f"[{session_id}] 成功向用户消息前注入记忆包"
-                            )
+                            logger.info(f"[{session_id}] 成功向用户消息前注入记忆包")
                     elif injection_method == "user_message_after":
                         if memory_str:
                             req.prompt = (req.prompt or "") + "\n\n" + memory_str
-                            logger.info(
-                                f"[{session_id}] 成功向用户消息后注入记忆包"
-                            )
+                            logger.info(f"[{session_id}] 成功向用户消息后注入记忆包")
                     elif injection_method == "fake_tool_call":
                         memory_list = [
                             {
@@ -648,7 +680,9 @@ class MemoryRecall:
             normalized += 1
 
         if normalized:
-            logger.debug(f"[{session_id}] 已归一化 {normalized} 条纯文本历史 content parts")
+            logger.debug(
+                f"[{session_id}] 已归一化 {normalized} 条纯文本历史 content parts"
+            )
         return normalized
 
     def _remove_fake_tool_call_from_context(

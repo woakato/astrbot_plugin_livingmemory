@@ -6,6 +6,7 @@ MemoryEngine 的 MemoryEngineCrudMixin 拆分模块
 import asyncio
 import json
 import time
+import uuid
 from typing import Any
 
 import aiosqlite
@@ -1263,10 +1264,16 @@ class MemoryEngineCrudMixin:
             "importance": 0.95,
             "create_time": now,
         }
+        # FAISS DocumentStorage owns the real documents table where doc_id is
+        # NOT NULL and UNIQUE; a core row must carry its own stable identifier.
         cursor = await self.db_connection.execute(
-            "INSERT INTO documents(text, metadata, created_at, updated_at) "
-            "VALUES (?, ?, datetime('now'), datetime('now'))",
-            (content.strip()[:500], json.dumps(metadata, ensure_ascii=False)),
+            "INSERT INTO documents(doc_id, text, metadata, created_at, updated_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+            (
+                f"core-{uuid.uuid4()}",
+                content.strip()[:500],
+                json.dumps(metadata, ensure_ascii=False),
+            ),
         )
         await self.db_connection.commit()
         self._invalidate_search_cache()
@@ -1320,28 +1327,40 @@ class MemoryEngineCrudMixin:
             if meta.get("core_enabled") is False:
                 continue
             scope = str(meta.get("core_scope") or "global")
-            if scope == "session" and session_id and \
-                    str(meta.get("core_session_id") or "") != session_id:
-                continue
-            if scope == "persona" and persona_id and \
-                    str(meta.get("core_persona_id") or "") != persona_id:
-                continue
-            if scope == "user" and user_id and \
-                    str(meta.get("core_user_id") or "") != user_id:
-                continue
+            # Fail-closed residency: a non-global block only loads when the
+            # current turn positively carries the matching domain key; a turn
+            # that cannot tell (empty id) must not pull in other domains'
+            # private blocks.
+            if scope == "session":
+                if (
+                    not session_id
+                    or str(meta.get("core_session_id") or "") != session_id
+                ):
+                    continue
+            elif scope == "persona":
+                if (
+                    not persona_id
+                    or str(meta.get("core_persona_id") or "") != persona_id
+                ):
+                    continue
+            elif scope == "user":
+                if not user_id or str(meta.get("core_user_id") or "") != user_id:
+                    continue
             text = str(row["text"] or "").strip()
             if not text:
                 continue
             if used + len(text) > max_chars:
                 continue
             used += len(text)
-            blocks.append({
-                "memory_id": int(row["id"]),
-                "label": str(meta.get("core_label") or ""),
-                "kind": str(meta.get("core_kind") or "rule"),
-                "priority": float(meta.get("core_priority") or 50),
-                "text": text,
-            })
+            blocks.append(
+                {
+                    "memory_id": int(row["id"]),
+                    "label": str(meta.get("core_label") or ""),
+                    "kind": str(meta.get("core_kind") or "rule"),
+                    "priority": float(meta.get("core_priority") or 50),
+                    "text": text,
+                }
+            )
         return blocks
 
     async def list_core_memories(self) -> list[dict[str, Any]]:
@@ -1367,16 +1386,18 @@ class MemoryEngineCrudMixin:
         items = []
         for row in rows:
             meta = safe_json_dict(row["metadata"])
-            items.append({
-                "memory_id": int(row["id"]),
-                "label": str(meta.get("core_label") or ""),
-                "kind": str(meta.get("core_kind") or "rule"),
-                "priority": float(meta.get("core_priority") or 50),
-                "scope": str(meta.get("core_scope") or "global"),
-                "session_id": str(meta.get("core_session_id") or ""),
-                "persona_id": str(meta.get("core_persona_id") or ""),
-                "text": str(row["text"] or ""),
-            })
+            items.append(
+                {
+                    "memory_id": int(row["id"]),
+                    "label": str(meta.get("core_label") or ""),
+                    "kind": str(meta.get("core_kind") or "rule"),
+                    "priority": float(meta.get("core_priority") or 50),
+                    "scope": str(meta.get("core_scope") or "global"),
+                    "session_id": str(meta.get("core_session_id") or ""),
+                    "persona_id": str(meta.get("core_persona_id") or ""),
+                    "text": str(row["text"] or ""),
+                }
+            )
         return items
 
     async def delete_core_memory(self, memory_id: int) -> bool:
@@ -1440,29 +1461,36 @@ class MemoryEngineCrudMixin:
         loops: list[dict[str, Any]] = []
         for row in rows:
             meta = safe_json_dict(row["metadata"])
-            row_session = str(meta.get("core_session_id")
-                              or meta.get("source_session_id")
-                              or meta.get("session_id") or "")
+            row_session = str(
+                meta.get("core_session_id")
+                or meta.get("source_session_id")
+                or meta.get("session_id")
+                or ""
+            )
             if session_id and row_session and row_session != session_id:
                 continue
             create_time = float(meta.get("create_time") or row["id"] * 0 or now)
             due_ts = float(meta.get("due_ts") or 0.0)
-            loops.append({
-                "memory_id": int(row["id"]),
-                "content": str(row["text"] or "")[:300],
-                "session_id": row_session,
-                "create_time": create_time,
-                "age_days": round(max(0.0, (now - create_time) / 86400.0), 1),
-                "due_ts": due_ts,
-                "promise": bool(meta.get("promise")),
-                "reason": str(meta.get("open_loop_reason") or "未闭环话题")[:200],
-            })
+            loops.append(
+                {
+                    "memory_id": int(row["id"]),
+                    "content": str(row["text"] or "")[:300],
+                    "session_id": row_session,
+                    "create_time": create_time,
+                    "age_days": round(max(0.0, (now - create_time) / 86400.0), 1),
+                    "due_ts": due_ts,
+                    "promise": bool(meta.get("promise")),
+                    "reason": str(meta.get("open_loop_reason") or "未闭环话题")[:200],
+                }
+            )
         # Overdue-due first, then promise weight, then freshness.
-        loops.sort(key=lambda x: (
-            -(1.0 if x["due_ts"] and x["due_ts"] < now else 0.0),
-            -float(x["promise"]),
-            -x["create_time"],
-        ))
+        loops.sort(
+            key=lambda x: (
+                -(1.0 if x["due_ts"] and x["due_ts"] < now else 0.0),
+                -float(x["promise"]),
+                -x["create_time"],
+            )
+        )
         return loops[: max(1, min(int(limit), 12))]
 
     async def close_open_loop(self, memory_id: int) -> bool:
@@ -1501,6 +1529,30 @@ class MemoryEngineCrudMixin:
         """
         from ..companion.gate import message_terms
 
+        # Terms too generic to prove the specific loop was discussed: sharing
+        # "明天"/"记得" with an unrelated message must not close a promise.
+        # Any term *containing* a generic word is an n-gram anchored on it
+        # (message_terms slides 2-4 grams over whole blocks), so it counts as
+        # generic too.
+        generic = (
+            "明天",
+            "今天",
+            "后天",
+            "周末",
+            "下周",
+            "记得",
+            "答应",
+            "说好",
+            "约定",
+            "结果",
+            "事情",
+            "时候",
+            "这个",
+            "那个",
+            "一下",
+            "有事",
+        )
+
         text = (user_text or "").strip()
         if len(text) < 2 or self.db_connection is None:
             return []
@@ -1514,7 +1566,11 @@ class MemoryEngineCrudMixin:
         for loop in loops:
             content = str(loop.get("content") or "")
             loop_terms = set(message_terms(content))
-            if len(message_terms_set & loop_terms) >= 2:
+            overlap = message_terms_set & loop_terms
+            specific_overlap = {t for t in overlap if not any(g in t for g in generic)}
+            # Close only with >=2 shared terms of which at least one is a
+            # topic-specific carry word (面试/演唱会/...), never pure date chatter.
+            if len(overlap) >= 2 and specific_overlap:
                 if await self.close_open_loop(int(loop["memory_id"])):
                     closed.append(int(loop["memory_id"]))
                 if len(closed) >= max_close:

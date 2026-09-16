@@ -640,6 +640,18 @@
         "hint": "约定类记忆允许一句 60 字内的原话替代转述。",
         "type": "bool",
         "default": true
+      },
+      "enable_package": {
+        "description": "记忆包模式",
+        "hint": "关闭后退回旧版逐条注入格式（排查兼容性问题用）。",
+        "type": "bool",
+        "default": true
+      },
+      "state_guard_hours": {
+        "description": "状态闲聊时间窗",
+        "hint": "状态类闲聊只保留该小时数内的近期记忆。",
+        "type": "float",
+        "default": 6.0
       }
     }
   },

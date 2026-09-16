@@ -144,13 +144,19 @@ class LivingMemoryPlugin(Star):
         self._llm_tools_registered = False
         self._terminating = False
 
-        # Companion bridge: always construct (cheap), enable gate lives in
-        # config; companion plugin degrades gracefully on active=False.
-        self.companion_bridge = CompanionBridge(self)
-        self.memory_companion_bridge = self.companion_bridge
-        self._companion_token_counts: dict[str, int] = {}
+        # Companion bridge: constructed always (cheap), but when the config
+        # switch is off the plugin publishes no bridge surface at all — the
+        # companion sees "no memory plugin" and falls back to its own path.
+        bridge = CompanionBridge(self)
+        self.companion_bridge = bridge
         global _ACTIVE_BRIDGE
-        _ACTIVE_BRIDGE = self.companion_bridge
+        if self.is_companion_bridge_enabled():
+            self.memory_companion_bridge = bridge
+            _ACTIVE_BRIDGE = bridge
+        else:
+            self.memory_companion_bridge = None
+            _ACTIVE_BRIDGE = None
+        self._companion_token_counts: dict[str, int] = {}
 
         self.page_api = None
         set_active_plugin(self)
@@ -210,7 +216,11 @@ class LivingMemoryPlugin(Star):
             for platform in cfg.get("platforms", []) or []:
                 if not isinstance(platform, dict):
                     continue
-                settings = platform.get("bot_config") or platform.get("platform_settings") or {}
+                settings = (
+                    platform.get("bot_config")
+                    or platform.get("platform_settings")
+                    or {}
+                )
                 identity = (
                     settings.get("self_id")
                     or settings.get("account")
@@ -337,8 +347,7 @@ class LivingMemoryPlugin(Star):
         try:
             if not await is_session_enabled(event.unified_msg_origin):
                 logger.debug(
-                    f"[{event.unified_msg_origin}] 当前会话已关闭，"
-                    "跳过被动群聊消息捕获"
+                    f"[{event.unified_msg_origin}] 当前会话已关闭，跳过被动群聊消息捕获"
                 )
                 return
             if not await is_plugin_enabled_for_session(event.unified_msg_origin):
@@ -528,7 +537,7 @@ class LivingMemoryPlugin(Star):
         marker = "core"
         start = lowered.find(marker, lowered.find("lmem"))
         if start >= 0:
-            tail = raw[start + len(marker):].strip()
+            tail = raw[start + len(marker) :].strip()
             tokens = tail.split(None, 1)
             if len(tokens) == 2:
                 action, rest = tokens[0], tokens[1]

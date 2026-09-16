@@ -15,14 +15,20 @@ opens its own aiosqlite connection with WAL + busy_timeout).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
+
+# Companion event dates are Beijing-local: every user-facing "today" query
+# (self-line, fast context) reads the local calendar day, so storage must
+# bucket by the same timezone or early-morning events land on the wrong day.
+_TZ_SHANGHAI = timezone(timedelta(hours=8))
 
 # Acked afterglow rows older than this are cleared by the weekly task.
 _EMOTION_RETENTION_SECONDS = 7 * 24 * 3600
@@ -61,8 +67,18 @@ def to_epoch_seconds(value: Any) -> float:
 
 
 def event_date_of(occurred_at: float) -> str:
-    """Return the YYYY-MM-DD date string for an epoch-seconds timestamp."""
-    return datetime.fromtimestamp(occurred_at, tz=timezone.utc).strftime("%Y-%m-%d")
+    """Return the YYYY-MM-DD Beijing date string for an epoch-seconds timestamp.
+
+    Day-window queries (fast-context, self-line) compare against the local
+    calendar day, so storage must bucket by Asia/Shanghai; UTC bucketing drops
+    or misplaces events between 00:00 and 08:00 Beijing time.
+    """
+    return datetime.fromtimestamp(occurred_at, tz=_TZ_SHANGHAI).strftime("%Y-%m-%d")
+
+
+def today_date() -> str:
+    """Beijing-calendar "today" for day-window queries and the self-line slot."""
+    return datetime.now(tz=_TZ_SHANGHAI).strftime("%Y-%m-%d")
 
 
 class CompanionStore:
@@ -163,25 +179,126 @@ class CompanionStore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def make_event_key(kind: str, bot_id: str, scope: str, session_id: str,
-                       subject_id: str, content: str, occurred_at: float) -> str:
+    def make_event_key(
+        kind: str,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+        subject_id: str,
+        content: str,
+        occurred_at: float,
+    ) -> str:
         """Domain-separated dedupe key so companion retries never double-write."""
         digest = uuid.uuid5(
             uuid.NAMESPACE_URL,
             "lmce:v1:"
             + ":".join(
-                (kind, bot_id, scope, session_id, subject_id,
-                 content[:200], f"{to_epoch_seconds(occurred_at):.0f}")
+                (
+                    kind,
+                    bot_id,
+                    scope,
+                    session_id,
+                    subject_id,
+                    content[:200],
+                    f"{to_epoch_seconds(occurred_at):.0f}",
+                )
             ),
         ).hex
         return f"lmce_{digest[:24]}"
 
-    async def upsert_event(self, *, kind: str, content: str, bot_id: str = "",
-                           persona_id: str = "", scope: str = "", session_id: str = "",
-                           user_id: str = "", group_id: str = "",
-                           window_slug: str = "", occurred_at: Any = None,
-                           importance: float = 0.5, metadata: dict | None = None,
-                           event_key: str = "") -> tuple[str, bool]:
+    @staticmethod
+    def stable_key(prefix: str, identity: str) -> str:
+        """Process-independent stable key (Python hash() is salted per-run)."""
+        return prefix + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def archive_payload_fingerprint(payload_text: str) -> str:
+        """Stable fingerprint of an archive payload JSON for version-conflict checks."""
+        return hashlib.sha256(payload_text.encode("utf-8")).hexdigest()[:20]
+
+    async def upsert_archive_event(
+        self, *, event_key: str, version: int, fingerprint: str, **fields: Any
+    ) -> dict[str, Any]:
+        """Version-aware archive insert mirroring MC's conflict ladder.
+
+        MC service.py:2070-2079 semantics, keyed on the envelope's stable
+        idempotency-derived event_key:
+        - no row yet, or incoming version higher -> supersede/store: sent
+        - stored version higher -> stale_version (caller reports, never writes)
+        - equal version, same fingerprint -> deduplicated
+        - equal version, different payload -> version_conflict
+
+        Args:
+            event_key: stable key derived from the idempotency key.
+            version: envelope version (monotonic per idempotency key).
+            fingerprint: payload fingerprint at this version.
+            **fields: remaining upsert_event kwargs (kind/content/...).
+
+        Returns:
+            Dict with keys state (sent/deduplicated/stale_version/
+            version_conflict), version (the winning row's version),
+            deduplicated (bool).
+        """
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT CAST(COALESCE(json_extract(metadata, '$.archive_version'), 1)"
+                " AS INTEGER) AS version, "
+                "COALESCE(json_extract(metadata, '$.payload_fingerprint'), '') AS fp "
+                "FROM companion_events WHERE event_key = ?",
+                (event_key,),
+            ) as cursor:
+                old = await cursor.fetchone()
+        if old is not None:
+            old_version = int(old["version"] or 1)
+            if old_version > version:
+                return {
+                    "state": "stale_version",
+                    "version": old_version,
+                    "deduplicated": False,
+                }
+            if old_version == version:
+                if str(old["fp"] or "") == fingerprint:
+                    return {
+                        "state": "deduplicated",
+                        "version": old_version,
+                        "deduplicated": True,
+                    }
+                return {
+                    "state": "version_conflict",
+                    "version": old_version,
+                    "deduplicated": False,
+                }
+            # Incoming version higher: supersede before re-inserting, each
+            # statement in its own connection so the nested upsert_event
+            # (second connection) never races a held write lock.
+            async with self._connect() as db:
+                await db.execute(
+                    "DELETE FROM companion_events WHERE event_key = ?", (event_key,)
+                )
+                await db.commit()
+        _key, deduped = await self.upsert_event(event_key=event_key, **fields)
+        if deduped:
+            # Lost a race against an identical insert: treat as dedupe.
+            return {"state": "deduplicated", "version": version, "deduplicated": True}
+        return {"state": "sent", "version": version, "deduplicated": False}
+
+    async def upsert_event(
+        self,
+        *,
+        kind: str,
+        content: str,
+        bot_id: str = "",
+        persona_id: str = "",
+        scope: str = "",
+        session_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        window_slug: str = "",
+        occurred_at: Any = None,
+        importance: float = 0.5,
+        metadata: dict | None = None,
+        event_key: str = "",
+    ) -> tuple[str, bool]:
         """Insert one mirrored companion event with dedupe protection.
 
         Args:
@@ -207,19 +324,36 @@ class CompanionStore:
                 ON CONFLICT(event_key) DO NOTHING
                 """,
                 (
-                    key, kind, content[:4000], bot_id, persona_id, scope, session_id,
-                    user_id, group_id, event_date_of(ts), window_slug, ts, importance,
+                    key,
+                    kind,
+                    content[:4000],
+                    bot_id,
+                    persona_id,
+                    scope,
+                    session_id,
+                    user_id,
+                    group_id,
+                    event_date_of(ts),
+                    window_slug,
+                    ts,
+                    importance,
                     json.dumps(metadata or {}, ensure_ascii=False),
                 ),
             )
             await db.commit()
             return key, cursor.rowcount == 0
 
-    async def list_events_between(self, *, bot_id: str = "", kind: str = "",
-                                  kinds: tuple[str, ...] | None = None,
-                                  session_id: str = "",
-                                  since_date: str = "", until_date: str = "",
-                                  limit: int = 20) -> list[dict[str, Any]]:
+    async def list_events_between(
+        self,
+        *,
+        bot_id: str = "",
+        kind: str = "",
+        kinds: tuple[str, ...] | None = None,
+        session_id: str = "",
+        since_date: str = "",
+        until_date: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
         """Day-window query for fast contexts and the self-line slot."""
         sql = "SELECT * FROM companion_events WHERE archived = 0"
         params: list[Any] = []
@@ -256,13 +390,18 @@ class CompanionStore:
             out.append(item)
         return out
 
-    async def purge_proactive_between(self, *, bot_id: str, since_date: str,
-                                      before_occurred_at: float) -> int:
-        """Soft-remove proactive-message noise older than a boundary (clean_proactive_history)."""
+    async def purge_proactive_between(
+        self, *, bot_id: str, since_date: str, before_occurred_at: float
+    ) -> int:
+        """Soft-remove proactive-message noise older than a boundary (clean_proactive_history).
+
+        kind must match what the bridge writes for proactive turns
+        (``proactive_message`` in _RECORD_DEFAULTS), not the bare word.
+        """
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE companion_events SET archived = 1 "
-                "WHERE kind = 'proactive' AND bot_id = ? AND event_date >= ? "
+                "WHERE kind = 'proactive_message' AND bot_id = ? AND event_date >= ? "
                 "AND occurred_at < ? AND archived = 0",
                 (bot_id, since_date, before_occurred_at),
             )
@@ -273,7 +412,9 @@ class CompanionStore:
     # emotion_ledger
     # ------------------------------------------------------------------
 
-    async def record_emotion(self, event: dict[str, Any], *, context: dict[str, str]) -> dict[str, Any]:
+    async def record_emotion(
+        self, event: dict[str, Any], *, context: dict[str, str]
+    ) -> dict[str, Any]:
         """Upsert one normalized emotion event, then return the ledger view.
 
         Args:
@@ -285,8 +426,10 @@ class CompanionStore:
         """
         event_id = str(event.get("event_id") or "")
         occurred = to_epoch_seconds(event.get("occurred_at"))
-        expires = to_epoch_seconds(event.get("expires_at")) if event.get("expires_at") else (
-            occurred + _DEFAULT_AFTERGLOW_TTL_SECONDS
+        expires = (
+            to_epoch_seconds(event.get("expires_at"))
+            if event.get("expires_at")
+            else (occurred + _DEFAULT_AFTERGLOW_TTL_SECONDS)
         )
         modulation = {
             "schema_version": "affect_modulation.v1",
@@ -299,12 +442,32 @@ class CompanionStore:
         }
         async with self._connect() as db:
             async with db.execute(
-                "SELECT revision, delivery_state FROM emotion_ledger WHERE event_id = ?",
+                "SELECT revision, delivery_state, payload_hash FROM emotion_ledger "
+                "WHERE event_id = ?",
                 (event_id,),
             ) as cursor:
                 old = await cursor.fetchone()
-            revision = int((old["revision"] if old else 0) or 0) + 1 if old else int(event.get("revision") or 1)
-            # A correction (revision bump) restarts delivery.
+            new_revision = int(event.get("revision") or 1)
+            new_hash = str(event.get("payload_hash") or "")
+            if old is not None:
+                old_hash = str(old["payload_hash"] or "")
+                # Identical re-record (same payload): keep delivery state —
+                # a companion retry must not restart the afterglow delivery
+                # (MC treats repeated events as no-ops once delivered/acked).
+                if (
+                    new_hash
+                    and old_hash
+                    and new_hash == old_hash
+                    and new_revision <= int(old["revision"] or 0)
+                ):
+                    stored = dict(event)
+                    stored["revision"] = int(old["revision"] or 0)
+                    stored["delivery_state"] = str(old["delivery_state"] or "pending")
+                    return stored
+                # Correction (payload or revision changed) restarts delivery.
+                revision = int(old["revision"] or 0) + 1
+            else:
+                revision = new_revision
             state = "pending"
             await db.execute(
                 """
@@ -325,19 +488,34 @@ class CompanionStore:
                     modulation=excluded.modulation, raw_event=excluded.raw_event
                 """,
                 (
-                    event_id, event.get("trace_id") or "", revision,
+                    event_id,
+                    event.get("trace_id") or "",
+                    revision,
                     event.get("event_type") or "neutral",
-                    float(event.get("intensity") or 0.0), float(event.get("confidence") or 0.0),
+                    float(event.get("intensity") or 0.0),
+                    float(event.get("confidence") or 0.0),
                     float(event.get("applied_energy_delta") or 0.0),
-                    float(event.get("valence_hint") or 0.0), float(event.get("arousal_hint") or 0.0),
+                    float(event.get("valence_hint") or 0.0),
+                    float(event.get("arousal_hint") or 0.0),
                     float(event.get("vulnerability_hint") or 0.0),
-                    event.get("producer_plugin") or "unknown", event.get("origin_kind") or "interaction",
-                    context.get("bot_id", ""), context.get("scope", "private"),
-                    context.get("platform", ""), context.get("user_id", ""),
+                    event.get("producer_plugin") or "unknown",
+                    event.get("origin_kind") or "interaction",
+                    context.get("bot_id", ""),
+                    context.get("scope", "private"),
+                    context.get("platform", ""),
+                    context.get("user_id", ""),
                     context.get("session_id", ""),
-                    (event.get("quoted_target_ref") or {}).get("id", "") if isinstance(event.get("quoted_target_ref"), dict) else "",
-                    event.get("dedupe_key") or "", event.get("payload_hash") or "",
-                    occurred, expires, state, "", 0.0, 0,
+                    (event.get("quoted_target_ref") or {}).get("id", "")
+                    if isinstance(event.get("quoted_target_ref"), dict)
+                    else "",
+                    event.get("dedupe_key") or "",
+                    event.get("payload_hash") or "",
+                    occurred,
+                    expires,
+                    state,
+                    "",
+                    0.0,
+                    0,
                     json.dumps(modulation, ensure_ascii=False),
                     json.dumps(event, ensure_ascii=False, default=str),
                 ),
@@ -348,9 +526,16 @@ class CompanionStore:
         stored["delivery_state"] = state
         return stored
 
-    async def list_deliverable(self, *, scope: str, platform: str, user_id: str,
-                               session_id: str, allow_cross_window: bool = False,
-                               limit: int = 10) -> list[dict[str, Any]]:
+    async def list_deliverable(
+        self,
+        *,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool = False,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
         """Return afterglow events pending delivery for a private session domain.
 
         Args:
@@ -385,24 +570,31 @@ class CompanionStore:
                 modulation = json.loads(data.get("modulation") or "{}")
             except (json.JSONDecodeError, TypeError):
                 modulation = {}
-            out.append({
-                "event_id": data["event_id"],
-                "revision": data["revision"],
-                "trace_id": data["trace_id"],
-                "event_type": data["event_type"],
-                "intensity": data["intensity"],
-                "confidence": data["confidence"],
-                "energy_delta": data["energy_delta"],
-                "valence": data["valence"],
-                "arousal": data["arousal"],
-                "vulnerability": data["vulnerability"],
-                "occurred_at": datetime.fromtimestamp(data["occurred_at"], tz=timezone.utc).isoformat(),
-                "expires_at": (
-                    datetime.fromtimestamp(data["expires_at"], tz=timezone.utc).isoformat()
-                    if data["expires_at"] > 0 else ""
-                ),
-                "affect_modulation": modulation,
-            })
+            out.append(
+                {
+                    "event_id": data["event_id"],
+                    "revision": data["revision"],
+                    "trace_id": data["trace_id"],
+                    "event_type": data["event_type"],
+                    "intensity": data["intensity"],
+                    "confidence": data["confidence"],
+                    "energy_delta": data["energy_delta"],
+                    "valence": data["valence"],
+                    "arousal": data["arousal"],
+                    "vulnerability": data["vulnerability"],
+                    "occurred_at": datetime.fromtimestamp(
+                        data["occurred_at"], tz=timezone.utc
+                    ).isoformat(),
+                    "expires_at": (
+                        datetime.fromtimestamp(
+                            data["expires_at"], tz=timezone.utc
+                        ).isoformat()
+                        if data["expires_at"] > 0
+                        else ""
+                    ),
+                    "affect_modulation": modulation,
+                }
+            )
             # Mark delivered so repeated polling does not redeliver forever.
         if out:
             async with self._connect() as db:
@@ -443,18 +635,32 @@ class CompanionStore:
             await db.commit()
         return acked
 
-    async def peek_pending(self, *, bot_id: str = "", session_id: str = "",
-                           user_id: str = "", scope: str = "", platform: str = "",
-                           allow_cross_window: bool = False,
-                           limit: int = 3) -> list[dict[str, Any]]:
+    async def peek_pending(
+        self,
+        *,
+        bot_id: str = "",
+        session_id: str = "",
+        user_id: str = "",
+        scope: str = "",
+        platform: str = "",
+        allow_cross_window: bool = False,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
         """Read undelivered afterglow WITHOUT consuming it (main-chain slot).
 
         The delivery marking belongs to the bridge's list_emotion_events
         (companion plugin); the injection self-line must stay read-only.
         """
         now = time.time()
-        sql = ("SELECT event_type, occurred_at FROM emotion_ledger "
-               "WHERE delivery_state='pending' AND (expires_at <= 0 OR expires_at > ?)")
+        # Fail-closed domain filter: without a cross-window match and without
+        # a session id there is no legitimate domain to read — returning rows
+        # unfiltered would leak other sessions' afterglow into this turn.
+        if not (allow_cross_window and user_id) and not session_id:
+            return []
+        sql = (
+            "SELECT event_type, occurred_at FROM emotion_ledger "
+            "WHERE delivery_state='pending' AND (expires_at <= 0 OR expires_at > ?)"
+        )
         params: list[Any] = [now]
         if bot_id:
             sql += " AND bot_id = ?"
@@ -475,12 +681,20 @@ class CompanionStore:
                 rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    async def interaction_stats(self, *, bot_id: str = "", scope: str = "",
-                                platform: str = "", user_id: str = "",
-                                since_ts: float) -> dict[str, int]:
+    async def interaction_stats(
+        self,
+        *,
+        bot_id: str = "",
+        scope: str = "",
+        platform: str = "",
+        user_id: str = "",
+        since_ts: float,
+    ) -> dict[str, int]:
         """Warm/scar event counts since a timestamp, for the relationship line."""
-        sql = ("SELECT event_type, COUNT(*) AS n FROM emotion_ledger "
-               "WHERE occurred_at >= ?")
+        sql = (
+            "SELECT event_type, COUNT(*) AS n FROM emotion_ledger "
+            "WHERE occurred_at >= ?"
+        )
         params: list[Any] = [since_ts]
         if bot_id:
             sql += " AND bot_id = ?"

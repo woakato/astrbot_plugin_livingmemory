@@ -206,7 +206,7 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 
 ## 12. 实施状态（fork-dev 分支，2026-09-16）
 
-已完成并验证（本地测试 774/774 全绿；提交见 git log）：
+已完成并验证（本地测试 804/804 全绿（774 原有 + 30 companion 桥接套件）；提交见 git log）：
 - [x] Phase 0 身份：metadata version=3.0.0、display_name=我会牢牢记住你；main.py 模块级 get_active_bridge/get_memory_companion_bridge + 类上 staticmethod 钩子 + terminate 收口。
 - [x] Phase 1a 契约：三份逐字复制（gitattributes 锁 LF；git blob==MC 原件 sha256 三方一致，验证过防 ruff 误改）。
 - [x] Phase 1b 桥：core/companion/bridge.py——握手（模拟 PC 比较逻辑零 mismatch）、compose_context（判废句形状正确）、record_*（幂等键+异步落库）、情绪六法（fail-closed 域校验、peek 与 deliver 分离）、defer/coordination/open_loops/relationship 形状、terminate 令牌轮换。
@@ -216,6 +216,22 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 - [x] Phase 3c 管理面：/lmem core list|add|del（原始整行自行解析避免逐词截断）+ manage_core_memory agent 工具（默认开）+ 三语后端 i18n + schema/validator 开关注册。
 - [x] Phase 3d/4：core/companion/open_loop.py（纯规则承诺/待办/时间推断，含到期排序）；反思链打标；resolve_open_loops_by_text 关键词重叠消解（挂召回链）；close_stale_open_loops 45 天老化；CompanionMaintenanceScheduler（日频：purge_expired + 情绪蒸馏规则式零 LLM + 老化，finalize 接线 + stop/teardown 对称）。蒸馏/幂等/跳过行为验证过。
 - [x] Phase 6：_conf_schema.json 新段（companion_bridge/core_memory/companion_slots/agent_tools 开关）+ en/ru 前端覆盖 + zh/en/ru 后端 core 命令文案 + 版本常量 3.0.0 三处同步（backup_manager/package.json/lock，测试强制）。
+
+审计修复轮（两路子代理验收，逐条对源码复核后落地；本地测试 804/804 全绿）：
+- [x] P1-1 核心记忆 INSERT 缺 doc_id（真 FAISS 表 NOT NULL+UNIQUE，探针复现 IntegrityError）→ 补 `core-{uuid4}`。
+- [x] P1-2 defer 读取通道错位：PC 裸 setattr 在 event/req 上，原读 get_extra 永远落空 → getattr(event)→getattr(req)→get_extra 三级回退。
+- [x] P1-3 load_core_memories fail-open：scope=session/persona/user 且当轮拿不到对应 id 时原会放行全部 → 改 fail-closed（缺域键即拒），global 不受影响。
+- [x] P1-4 _TIME_MARK_RE 过宽（`[周天日]末?` 命中"今天天气"）→ 收窄为完整时间词；原文替代加 has_source 守卫，无源记忆不再空查 source 表。
+- [x] P1-5 composer 预算虚高（只计正文，标签/换行/提示包裹漏算，实测 1000→1334）→ 全面改为按渲染段计费 + wrapper 预留 + 行级门禁 + 尾档 40；空结果判废句作为协议例外仍必发（保 PC `count("\n- ")<=1` 丢弃规则）。
+- [x] P1-6 未闭环：显式"X月Y日"过期错判次月 → 跨年正确；"明天再说吧"误标 → 推迟语只认硬承诺；消解 overlap 泛词（明天/记得/结果…及其 n-gram 派生词）黑名单 + 至少 1 个话题实义词双条件。
+- [x] BUG#1 archive 键用 salted `hash()`（跨进程不稳定→重启重复入库吞版本）→ sha256 稳定键 + companion_store.upsert_archive_event 版本阶梯（sent/deduplicated/version_conflict/stale_version，对齐 MC service.py:2070-2079；PC outbox 对 conflict/stale 走 dead-letter 语义保持）。
+- [x] BUG#2 bot_id 格式分裂：桥写 `aiocqhttp:10001`（main.bot_id 带平台前缀），PC 查询/生产钩给裸 `10001` → `_canonical_bot_id` 统一裸 self_id（写入/查询/producer namespace 三处）。
+- [x] BUG#3 情绪契约缺 `boundary_violation`（PC 白名单已含，属 MC1.10.5 后新增）→ contracts/emotion_event_contract.py 同步 PC 版（逐字节 diff 仅第 14 行，现与 PC 全等）；蒸馏短语表补"越界"条。指纹常量为 PC 模块内自算自比，跨插件不同步比对，握手无影响（bot_personal 指纹 ecf1d69406a8445d 三方一致不变）。
+- [x] BUG#4 companion_bridge.enabled=false 不生效 → `_disabled()` 统一门（lifecycle+config）接入 probe/coordination/defer/compose/record/archive/emotion 全部公共面；main.__init__ 关闭时不发布 `_ACTIVE_BRIDGE`/`memory_companion_bridge`（PC 属性探测链 memory_companion→memory_companion_bridge→bridge→_ACTIVE_BRIDGE 全空即降级）。
+- [x] P1-7 record_emotion 同 payload 重投重置 pending 导致反复余波 → payload_hash 相同且 revision 不升时保留现状态；revision 提升仍重启投递（有测试）。
+- [x] P1-8 peek_pending session_id 空串时不加域过滤（跨会话泄漏余波）→ fail-closed 返回 []。
+- [x] 杂项：companion_events 日期桶+两处"今天"查询统一 Asia/Shanghai（0-8 点错日）；维护调度改蒸馏先于清理（防 7 天保留边界丢蒸馏）；purge_proactive_between kind 修正为 proactive_message；schema 补 enable_package/state_guard_hours + en/ru 覆盖；except 日志全部带异常值。
+- [x] 测试：tests/test_companion_bridge.py 30 例（doc_id/域隔离/预算硬顶 6 档/判废协议/归档版本阶梯/情绪状态机/peek 域/bot_id 归一/北京日桶/门控负形状/打标矩阵含跨年/消解泛词守卫）。
 
 设计要点备忘：
 - 核心记忆=documents status='core'：BM25/FAISS/validator 只认 'active'，天然隔离、零 embedding、永不重复命中。删除走专用 delete_core_memory。

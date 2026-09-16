@@ -33,6 +33,7 @@ _EVENT_PHRASES = {
     "warm_memory": "一段温暖的共同记忆",
     "vulnerable_resonance": "彼此袒露过柔软",
     "hurt": "有过一次不愉快",
+    "boundary_violation": "越界行为被认真记下，边界还在",
     "comfort": "被安慰过",
     "praise": "被认真夸奖过",
     "intimacy": "关系更近了一步",
@@ -88,8 +89,11 @@ class CompanionMaintenanceScheduler:
             try:
                 now = datetime.now()
                 target = now.replace(
-                    hour=self.check_hour, minute=self.check_minute,
-                    second=0, microsecond=0)
+                    hour=self.check_hour,
+                    minute=self.check_minute,
+                    second=0,
+                    microsecond=0,
+                )
                 if target <= now:
                     target += timedelta(days=1)
                 await asyncio.sleep((target - now).total_seconds())
@@ -111,15 +115,17 @@ class CompanionMaintenanceScheduler:
             return {"skipped": 1}
 
         result = {"purged": 0, "distilled": 0, "aged_out": 0}
-        try:
-            result["purged"] = await store.purge_expired()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[陪伴维护] 账本清理失败: {exc}")
-
+        # Distill before purge: purge_expired removes acked rows past the
+        # retention window, which are exactly what the distiller reads.
         try:
             result["distilled"] = await self._distill_emotions(store)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[陪伴维护] 情绪蒸馏失败: {exc}")
+
+        try:
+            result["purged"] = await store.purge_expired()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[陪伴维护] 账本清理失败: {exc}")
 
         try:
             result["aged_out"] = await self._age_out_open_loops()

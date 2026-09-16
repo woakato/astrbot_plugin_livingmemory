@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 EMOTION_EVENT_SCHEMA_VERSION = "companion_emotion_event.v1"
 EMOTION_EVENT_TYPES = frozenset({
-    "neutral", "hurt", "apology", "comfort", "praise", "comfort_need",
+    "neutral", "hurt", "boundary_violation", "apology", "comfort", "praise", "comfort_need",
     "external_negative", "scar_touched", "warm_memory", "vulnerable_resonance",
     "play", "intimacy", "boundary",
 })
