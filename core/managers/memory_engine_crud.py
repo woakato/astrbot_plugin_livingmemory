@@ -1482,6 +1482,75 @@ class MemoryEngineCrudMixin:
         self._invalidate_search_cache()
         return cursor.rowcount > 0
 
+    async def resolve_open_loops_by_text(
+        self, *, session_id: str | None, user_text: str, max_close: int = 2
+    ) -> list[int]:
+        """Close open loops whose topic keywords appear in the user's reply.
+
+        Resolution heuristic (rule-based, safe to run every turn): a loop
+        closes when the current message mentions enough of the loop's own
+        keywords — e.g. after "面试过了" the "明天要面试" loop is resolved.
+
+        Args:
+            session_id: restrict candidate loops to this session when set.
+            user_text: the current user message.
+            max_close: safety cap on closes per turn.
+
+        Returns:
+            List of closed documents ids.
+        """
+        from ..companion.gate import message_terms
+
+        text = (user_text or "").strip()
+        if len(text) < 2 or self.db_connection is None:
+            return []
+        loops = await self.load_open_loop_memories(session_id=session_id, limit=12)
+        if not loops:
+            return []
+        message_terms_set = set(message_terms(text))
+        if not message_terms_set:
+            return []
+        closed: list[int] = []
+        for loop in loops:
+            content = str(loop.get("content") or "")
+            loop_terms = set(message_terms(content))
+            if len(message_terms_set & loop_terms) >= 2:
+                if await self.close_open_loop(int(loop["memory_id"])):
+                    closed.append(int(loop["memory_id"]))
+                if len(closed) >= max_close:
+                    break
+        return closed
+
+    async def close_stale_open_loops(self, *, before_create_time: float) -> int:
+        """Close loops older than the cutoff that have no future due date.
+
+        Args:
+            before_create_time: epoch seconds cutoff; loops created before
+                it with no (or already-past) due_ts are aged out.
+
+        Returns:
+            Number of loops closed.
+        """
+        if self.db_connection is None:
+            return 0
+        cursor = await self.db_connection.execute(
+            """
+            UPDATE documents
+            SET metadata = json_set(metadata, '$.open_loop_closed', 1),
+                updated_at = datetime('now')
+            WHERE json_valid(metadata)
+              AND COALESCE(json_extract(metadata, '$.status'), 'active') = 'active'
+              AND COALESCE(CAST(json_extract(metadata, '$.open_loop') AS INTEGER), 0) = 1
+              AND COALESCE(CAST(json_extract(metadata, '$.open_loop_closed') AS INTEGER), 0) = 0
+              AND COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) < ?
+              AND COALESCE(CAST(json_extract(metadata, '$.due_ts') AS REAL), 0) < ?
+            """,
+            (before_create_time, time.time()),
+        )
+        await self.db_connection.commit()
+        self._invalidate_search_cache()
+        return cursor.rowcount
+
     async def update_importance(self, memory_id: int, new_importance: float) -> bool:
         """
         更新记忆重要性

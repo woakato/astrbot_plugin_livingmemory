@@ -199,6 +199,30 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 ## 11. 风险登记
 
 - display_name 改动使 AstrBot 列表显示"我会牢牢记住你"——用户知情（决策 §0）。
-- LM 上游若发新版，fork 需手工 rebase 差异（无 git 跟踪；备份目录保留对照）。
+- LM 上游若发新版，fork 需手工 rebase 差异（备份目录保留对照；fork-dev 分支已挂 origin，上游 master 可 fetch 对比）。
 - PC 升级若改契约（REVISION→4），握手 fail-closed 桥断开——升级 PC 前先看两侧契约版本。
 - compose_context 1.0s 预算内含 FAISS 查询+装箱：embedding provider 慢时快档不受影响（时间索引纯 SQL），默认档检索超时→search_route 降级空结果→判废原句，符合协议。
+- 上游 2.7.0-beta.1 存在若干文件级 ruff I001（imports 未排序）存量，本 fork 不顺手重排（控制 diff），仅保证自己触碰的文件干净。
+
+## 12. 实施状态（fork-dev 分支，2026-09-16）
+
+已完成并验证（本地测试 774/774 全绿；提交见 git log）：
+- [x] Phase 0 身份：metadata version=3.0.0、display_name=我会牢牢记住你；main.py 模块级 get_active_bridge/get_memory_companion_bridge + 类上 staticmethod 钩子 + terminate 收口。
+- [x] Phase 1a 契约：三份逐字复制（gitattributes 锁 LF；git blob==MC 原件 sha256 三方一致，验证过防 ruff 误改）。
+- [x] Phase 1b 桥：core/companion/bridge.py——握手（模拟 PC 比较逻辑零 mismatch）、compose_context（判废句形状正确）、record_*（幂等键+异步落库）、情绪六法（fail-closed 域校验、peek 与 deliver 分离）、defer/coordination/open_loops/relationship 形状、terminate 令牌轮换。
+- [x] Phase 2 存储：storage/companion_store.py（companion_events + emotion_ledger + peek_pending + interaction_stats），冒烟测试过状态机（投递/签收/修订重投/过期拒签）。
+- [x] Phase 3a 闸门：core/companion/gate.py（纯规则移植，去作者私有词表；吃了吗→state_only、嗯嗯/贴贴/你说错了→抑制，测试过）。
+- [x] Phase 3b 七件套主链：core/companion/composer.py（预算装箱+两出口包装，包在 <RAG-Faiss-Memory> 内免费幂等清理）+ core/companion/slots.py（核心/余波/关系/未闭环/今日自我+让位）+ memory_recall 接入（state_only 近期守卫、时间窗口提示行、重要原文 60 字、fake_tool_call 双通道兼容、legacy 回退开关 companion_slots.enable_package）。端到端模拟 8/8 通过。
+- [x] Phase 3c 管理面：/lmem core list|add|del（原始整行自行解析避免逐词截断）+ manage_core_memory agent 工具（默认开）+ 三语后端 i18n + schema/validator 开关注册。
+- [x] Phase 3d/4：core/companion/open_loop.py（纯规则承诺/待办/时间推断，含到期排序）；反思链打标；resolve_open_loops_by_text 关键词重叠消解（挂召回链）；close_stale_open_loops 45 天老化；CompanionMaintenanceScheduler（日频：purge_expired + 情绪蒸馏规则式零 LLM + 老化，finalize 接线 + stop/teardown 对称）。蒸馏/幂等/跳过行为验证过。
+- [x] Phase 6：_conf_schema.json 新段（companion_bridge/core_memory/companion_slots/agent_tools 开关）+ en/ru 前端覆盖 + zh/en/ru 后端 core 命令文案 + 版本常量 3.0.0 三处同步（backup_manager/package.json/lock，测试强制）。
+
+设计要点备忘：
+- 核心记忆=documents status='core'：BM25/FAISS/validator 只认 'active'，天然隔离、零 embedding、永不重复命中。删除走专用 delete_core_memory。
+- 蒸馏写入失败不标记 distilled（账本 7 天保留期内下次重试）；低强度/无映射直接标记跳过防重复扫。
+- bridge 的 _record/_afterglow_line 全部只读或异步，关键路径零阻塞。
+
+待办：
+- [ ] Phase 5 画像（默认关，独立开关 portrait.enabled=false 尚未进 schema——实现时一并加）。
+- [ ] 联机验收：禁用 MC → 启用 LM 3.0 → 按 §9 清单逐项过。
+- [ ] 上游更新时 rebase：git fetch origin && git log origin/master..fork-dev 对照。

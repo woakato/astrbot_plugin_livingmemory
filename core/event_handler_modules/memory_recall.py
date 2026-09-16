@@ -339,6 +339,22 @@ class MemoryRecall:
                         )
                     recalled_memories = fresh
 
+                # 未闭环消解：用户本轮亲口提到该话题 = 事已谈过/已有结果
+                try:
+                    resolver = getattr(
+                        self.memory_engine, "resolve_open_loops_by_text", None)
+                    if resolver is not None and self.config_manager.get(
+                            "companion_slots.enable_open_loops", True):
+                        closed = await resolver(
+                            session_id=recall_session_id or session_id,
+                            user_text=actual_query)
+                        if closed:
+                            logger.info(
+                                f"[{session_id}] 未闭环消解: {closed}")
+                except Exception as resolve_exc:  # noqa: BLE001
+                    logger.debug(
+                        f"[{session_id}] 未闭环消解失败: {resolve_exc}")
+
                 # 收集固定槽位（核心/情绪余波/关系/未闭环/今日自我）
                 deferred_sections: set[str] = set()
                 try:

@@ -418,6 +418,18 @@ class MemoryReflection:
                     }
                     metadata["source_session_id"] = session_id
 
+                    # 未闭环标记（纯规则，不依赖总结模型能力）
+                    try:
+                        from ..companion.open_loop import analyze_open_loop
+
+                        loop_meta = analyze_open_loop(content)
+                        if loop_meta and self.config_manager.get(
+                            "companion_slots.enable_open_loops", True
+                        ):
+                            metadata.update(loop_meta)
+                    except Exception as loop_exc:  # noqa: BLE001
+                        logger.debug(f"[{session_id}] 未闭环标记失败: {loop_exc}")
+
                     logger.info(
                         f"[{session_id}] 已使用LLM生成结构化记忆, "
                         f"主题={metadata.get('topics', [])}, "

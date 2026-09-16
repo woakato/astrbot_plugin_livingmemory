@@ -18,6 +18,7 @@ from .managers.consolidation_manager import MemoryConsolidationManager
 from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
 from .schedulers.decay_scheduler import DecayScheduler
+from .schedulers.companion_maintenance_scheduler import CompanionMaintenanceScheduler
 from .validators.index_validator import IndexValidator
 from .plugin_initializer_faiss import InitializerFaissMixin
 from .plugin_initializer_finalize import InitializerFinalizeMixin
@@ -69,6 +70,7 @@ class PluginInitializer(InitializerFaissMixin, InitializerFinalizeMixin):
         self.index_validator: IndexValidator | None = None
         self.decay_scheduler: DecayScheduler | None = None
         self.consolidation_manager: MemoryConsolidationManager | None = None
+        self.companion_maintenance_scheduler: CompanionMaintenanceScheduler | None = None
 
         # 初始化状态
         self._initialization_complete = False
@@ -384,6 +386,9 @@ class PluginInitializer(InitializerFaissMixin, InitializerFinalizeMixin):
         if self.decay_scheduler:
             await self.decay_scheduler.stop()
             self.decay_scheduler = None
+        if self.companion_maintenance_scheduler:
+            await self.companion_maintenance_scheduler.stop()
+            self.companion_maintenance_scheduler = None
 
     async def stop_background_tasks(self) -> None:
         """停止初始化阶段的后台任务（如Provider重试）"""

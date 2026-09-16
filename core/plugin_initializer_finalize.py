@@ -9,6 +9,7 @@ from .managers.conversation_manager import ConversationManager
 from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
 from .schedulers.decay_scheduler import DecayScheduler
+from .schedulers.companion_maintenance_scheduler import CompanionMaintenanceScheduler
 from .validators.index_validator import IndexValidator
 from .base.exceptions import InitializationError, ProviderNotReadyError
 from astrbot.api import logger
@@ -341,6 +342,18 @@ class InitializerFinalizeMixin:
                 self.decay_scheduler = scheduler
                 logger.info("DecayScheduler 已启动")
 
+            # 启动陪伴维护调度器（账本清理/情绪蒸馏/未闭环老化，日频轻量任务）
+            if (
+                self.companion_maintenance_scheduler is None
+                and self.config_manager.get("companion_bridge.enabled", True)
+            ):
+                companion_scheduler = CompanionMaintenanceScheduler(
+                    memory_engine=self.memory_engine,
+                )
+                await companion_scheduler.start()
+                self.companion_maintenance_scheduler = companion_scheduler
+                logger.info("CompanionMaintenanceScheduler 已启动")
+
             # 标记初始化完成
             self._initialization_complete = True
             logger.info("LivingMemory 插件初始化成功。")
@@ -635,6 +648,13 @@ class InitializerFinalizeMixin:
             except Exception:
                 logger.warning("停止衰减调度器失败", exc_info=True)
             self.decay_scheduler = None
+
+        if self.companion_maintenance_scheduler is not None:
+            try:
+                await self.companion_maintenance_scheduler.stop()
+            except Exception:
+                logger.warning("停止陪伴维护调度器失败", exc_info=True)
+            self.companion_maintenance_scheduler = None
 
         if self.conversation_manager is not None:
             if getattr(self.conversation_manager, "store", None) is not None:
