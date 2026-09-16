@@ -14,6 +14,7 @@ import aiosqlite
 from astrbot.api import logger
 
 from ...storage.atom_store import AtomStore
+from ...storage.companion_store import CompanionStore
 from ...storage.graph_store import GraphStore
 from ..managers.atom_lifecycle_manager import AtomLifecycleManager
 from ..managers.graph_memory_manager import GraphMemoryManager
@@ -142,6 +143,8 @@ class MemoryEngine(
         self.atom_store = None
         self.atom_lifecycle_manager = None
         self.atom_retriever = None
+        # Companion bridge storage: schedule/diary mirror + emotion ledger.
+        self.companion_store = None
         self.db_connection = None
         self._search_cache_enabled = bool(self.config.get("search_cache_enabled", True))
         self._search_cache_ttl = float(
@@ -246,6 +249,11 @@ class MemoryEngine(
                 self.config,
                 memory_batch_loader=self.faiss_db.document_storage.get_documents,
             )
+
+        # Companion bridge store lives independently of the graph subsystem.
+        if self.companion_store is None:
+            self.companion_store = CompanionStore(self.db_path)
+            await self.companion_store.initialize()
 
         if self._write_op_repair_enabled:
             await self._repair_incomplete_write_ops()

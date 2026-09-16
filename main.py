@@ -17,20 +17,36 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .core.base.config_manager import ConfigManager
 from .core.command_handler import CommandHandler
+from .core.companion.bridge import CompanionBridge
 from .core.event_handler import EventHandler
 from .core.i18n_backend import init as i18n_init
 from .core.i18n_backend import t
 from .core.managers.backup_manager import BackupManager
-from .core.passive_group_capture import PassiveGroupCaptureFilter
-from .core.passive_group_capture import get_active_plugin
-from .core.passive_group_capture import is_plugin_enabled_for_session
-from .core.passive_group_capture import is_session_enabled
-from .core.passive_group_capture import set_active_plugin
+from .core.passive_group_capture import (
+    PassiveGroupCaptureFilter,
+    get_active_plugin,
+    is_plugin_enabled_for_session,
+    is_session_enabled,
+    set_active_plugin,
+)
 from .core.plugin_initializer import PluginInitializer
 from .core.tools import MemoryMemorizeTool, MemorySearchTool
 
 _MIN_ASTRBOT_VERSION = "4.24.2"
 _ASTRBOT_DISTRIBUTION_NAMES = ("AstrBot", "astrbot")
+
+
+# Module-level bridge handles so the private_companion plugin can discover
+# us via sys.modules fallback in addition to the star registry (spec §2.1).
+_ACTIVE_BRIDGE: CompanionBridge | None = None
+
+
+def get_active_bridge() -> CompanionBridge | None:
+    return _ACTIVE_BRIDGE
+
+
+def get_memory_companion_bridge() -> CompanionBridge | None:
+    return _ACTIVE_BRIDGE
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
@@ -88,11 +104,16 @@ elif _version_lt(_CURRENT_ASTRBOT_VERSION, _MIN_ASTRBOT_VERSION):
     "LivingMemory",
     "lxfight",
     "An intelligent long-term memory plugin with a dynamic lifecycle for AstrBot.",
-    "2.7.0-beta.1",
+    "3.0.0",
     "https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory",
 )
 class LivingMemoryPlugin(Star):
     """LivingMemory 插件主类"""
+
+    # Companion-plugin discovery hooks: the private_companion adapter probes
+    # the star instance for these before falling back to module functions.
+    get_active_bridge = staticmethod(get_active_bridge)
+    get_memory_companion_bridge = staticmethod(get_memory_companion_bridge)
 
     def __init__(self, context: Context, config: dict[str, Any]):
         super().__init__(context)
@@ -122,6 +143,14 @@ class LivingMemoryPlugin(Star):
         self._component_init_lock = asyncio.Lock()
         self._llm_tools_registered = False
         self._terminating = False
+
+        # Companion bridge: always construct (cheap), enable gate lives in
+        # config; companion plugin degrades gracefully on active=False.
+        self.companion_bridge = CompanionBridge(self)
+        self.memory_companion_bridge = self.companion_bridge
+        self._companion_token_counts: dict[str, int] = {}
+        global _ACTIVE_BRIDGE
+        _ACTIVE_BRIDGE = self.companion_bridge
 
         self.page_api = None
         set_active_plugin(self)
@@ -160,6 +189,41 @@ class LivingMemoryPlugin(Star):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    # ------------------------------------------------------------------
+    # companion bridge support
+    # ------------------------------------------------------------------
+
+    def spawn_companion_background(self, coro) -> asyncio.Task:
+        """Run a bridge write off the request path as a tracked task."""
+        return self._create_tracked_task(coro)
+
+    def get_companion_token_usage(self) -> dict[str, Any]:
+        """Per-purpose LLM/embedding usage counters for the bridge report."""
+        return dict(self._companion_token_counts)
+
+    @property
+    def bot_id(self) -> str:
+        """Best-effort bot identity from the first configured platform."""
+        try:
+            cfg = self.context.get_config()
+            for platform in cfg.get("platforms", []) or []:
+                if not isinstance(platform, dict):
+                    continue
+                settings = platform.get("bot_config") or platform.get("platform_settings") or {}
+                identity = (
+                    settings.get("self_id")
+                    or settings.get("account")
+                    or platform.get("id")
+                )
+                if identity:
+                    return f"{platform.get('type', 'unknown')}:{identity}"
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def is_companion_bridge_enabled(self) -> bool:
+        return bool(self.config_manager.get("companion_bridge.enabled", True))
 
     async def _initialize_plugin(self):
         """初始化插件"""
@@ -580,6 +644,10 @@ class LivingMemoryPlugin(Star):
         self._terminating = True
         if get_active_plugin() is self:
             set_active_plugin(None)
+        global _ACTIVE_BRIDGE
+        self.companion_bridge.deactivate()
+        if _ACTIVE_BRIDGE is self.companion_bridge:
+            _ACTIVE_BRIDGE = None
 
         # 取消所有后台任务
         if self._background_tasks:
