@@ -145,6 +145,9 @@ class MemoryEngine(
         self.atom_retriever = None
         # Companion bridge storage: schedule/diary mirror + emotion ledger.
         self.companion_store = None
+        # REQ-036 user-portrait store (rule-based, LLM-free; spec §13).
+        self.portrait_store = None
+        self.portrait_service = None
         self.db_connection = None
         self._search_cache_enabled = bool(self.config.get("search_cache_enabled", True))
         self._search_cache_ttl = float(
@@ -254,6 +257,23 @@ class MemoryEngine(
         if self.companion_store is None:
             self.companion_store = CompanionStore(self.db_path)
             await self.companion_store.initialize()
+
+        # Portrait store follows the companion bridge master switch: it is
+        # useless without the companion's person identity anyway (spec §13).
+        if self.portrait_store is None and self.config.get("portrait_enabled", False):
+            from ...storage.portrait_store import PortraitStore
+
+            self.portrait_store = PortraitStore(self.db_path)
+            await self.portrait_store.initialize()
+
+            from ..companion.portrait_service import PortraitService
+
+            portrait_cfg = self.config.get("portrait") or {}
+
+            def _portrait_get(key: str, default: Any = None) -> Any:
+                return portrait_cfg.get(str(key).removeprefix("portrait."), default)
+
+            self.portrait_service = PortraitService(self.portrait_store, _portrait_get)
 
         if self._write_op_repair_enabled:
             await self._repair_incomplete_write_ops()

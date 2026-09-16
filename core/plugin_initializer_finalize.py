@@ -3,27 +3,30 @@ PluginInitializer 的 InitializerFinalizeMixin 拆分模块
 自动从 core/plugin_initializer.py 拆分，保持行为不变
 """
 
-from typing import Any
 import asyncio
-from .managers.conversation_manager import ConversationManager
+import time
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.core.provider.provider import Provider
+
 from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
-from .schedulers.decay_scheduler import DecayScheduler
-from .schedulers.companion_maintenance_scheduler import CompanionMaintenanceScheduler
-from .validators.index_validator import IndexValidator
 from .base.exceptions import InitializationError, ProviderNotReadyError
-from astrbot.api import logger
 from .faiss_async_persist import install_async_persist
 from .managers.consolidation_manager import MemoryConsolidationManager
+from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
-from pathlib import Path
-from astrbot.core.provider.provider import Provider
-import time
+from .schedulers.companion_maintenance_scheduler import CompanionMaintenanceScheduler
+from .schedulers.decay_scheduler import DecayScheduler
+from .validators.index_validator import IndexValidator
 
 
 class InitializerFinalizeMixin:
     """PluginInitializer 拆分模块：InitializerFinalizeMixin"""
+
     async def _complete_initialization(self):
         """完成完整的初始化流程"""
         if self._initialization_complete:
@@ -223,6 +226,29 @@ class InitializerFinalizeMixin:
                 "index_rebuild_max_failure_ratio": self.config_manager.get(
                     "index_rebuild_settings.max_failure_ratio", 0.02
                 ),
+                # REQ-036 portrait pipeline: gated by the bridge master switch
+                # plus its own enabled flag (spec §13).
+                "portrait_enabled": bool(
+                    self.config_manager.get("companion_bridge.enabled", True)
+                    and self.config_manager.get("portrait.enabled", False)
+                ),
+                "portrait": {
+                    "usage_min_confidence": self.config_manager.get(
+                        "portrait.usage_min_confidence", 0.75
+                    ),
+                    "inferred_freshness_days": self.config_manager.get(
+                        "portrait.inferred_freshness_days", 90
+                    ),
+                    "min_independent_evidence": self.config_manager.get(
+                        "portrait.min_independent_evidence", 3
+                    ),
+                    "daily_success_limit_per_person": self.config_manager.get(
+                        "portrait.daily_success_limit_per_person", 1
+                    ),
+                    "daily_attempt_limit_per_person": self.config_manager.get(
+                        "portrait.daily_attempt_limit_per_person", 2
+                    ),
+                },
             }
 
             # Rerank 提供商动态解析：每次调用时重新获取实例，
@@ -315,9 +341,7 @@ class InitializerFinalizeMixin:
             )
             consolidation_daily = (
                 self.config_manager.get("memory_consolidation.enabled", False)
-                and self.config_manager.get(
-                    "memory_consolidation.trigger", "daily"
-                )
+                and self.config_manager.get("memory_consolidation.trigger", "daily")
                 == "daily"
             )
             if self.memory_engine and (
@@ -343,9 +367,8 @@ class InitializerFinalizeMixin:
                 logger.info("DecayScheduler 已启动")
 
             # 启动陪伴维护调度器（账本清理/情绪蒸馏/未闭环老化，日频轻量任务）
-            if (
-                self.companion_maintenance_scheduler is None
-                and self.config_manager.get("companion_bridge.enabled", True)
+            if self.companion_maintenance_scheduler is None and self.config_manager.get(
+                "companion_bridge.enabled", True
             ):
                 companion_scheduler = CompanionMaintenanceScheduler(
                     memory_engine=self.memory_engine,

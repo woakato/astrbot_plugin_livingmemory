@@ -655,6 +655,49 @@
       }
     }
   },
+  "portrait": {
+    "description": "用户画像（REQ-036）",
+    "hint": "从用户第一人称陈述中按规则提取稳定偏好画像（纯正则，不调用大模型）。需要陪伴插件联动才有数据来源，默认关闭。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用画像",
+        "hint": "开启后每条消息做零成本的规则式陈述提取；画像数据只保存哈希证据与短摘要。关闭则整个画像面降级为不可用。",
+        "type": "bool",
+        "default": false
+      },
+      "min_independent_evidence": {
+        "description": "智能画像证据阈值",
+        "hint": "同一画像结论需要至少几条去重后的独立表述才升级为推断画像。（允许范围：1–16）",
+        "type": "int",
+        "default": 3
+      },
+      "usage_min_confidence": {
+        "description": "使用置信度下限",
+        "hint": "低于此置信度的画像条目不会提供给陪伴插件。（允许范围：0–1）",
+        "type": "float",
+        "default": 0.75
+      },
+      "inferred_freshness_days": {
+        "description": "推断保鲜天数",
+        "hint": "超过该天数的推断画像自动停用。",
+        "type": "int",
+        "default": 90
+      },
+      "daily_success_limit_per_person": {
+        "description": "单人每日成功上限",
+        "hint": "每人每天最多成功升级几条推断画像。",
+        "type": "int",
+        "default": 1
+      },
+      "daily_attempt_limit_per_person": {
+        "description": "单人每日尝试上限",
+        "hint": "含失败退避，防止每晚对同一人反复重扫。",
+        "type": "int",
+        "default": 2
+      }
+    }
+  },
   "graph_memory": {
     "description": "图记忆双路检索",
     "hint": "启用后会同时维护文档路和图路，两边都支持关键词与向量检索，再统一融合召回结果。",

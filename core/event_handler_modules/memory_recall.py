@@ -18,12 +18,14 @@ from astrbot.core.agent.message import TextPart
 from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
 from ..companion.composer import MemoryItem, PackageComposer
 from ..companion.gate import decide_gate, parse_time_window
+from ..companion.portrait_service import resolve_turn_scope, spawn_portrait_capture
 from ..companion.slots import collect_slots
 from ..memory_scope import (
     is_event_memory_allowed,
     is_suspicious_session_id,
     resolve_memory_scope,
 )
+from ..passive_group_capture import get_active_plugin
 from ..utils import (
     OperationContext,
     format_memories_for_fake_tool_call,
@@ -143,6 +145,31 @@ class MemoryRecall:
             timestamp /= 1000.0
         return timestamp if timestamp > 0 else None
 
+    async def _capture_portrait_turn(
+        self, event, session_id: str, text: str, is_group: bool
+    ) -> None:
+        """Fire-and-forget REQ-036 portrait capture for one user turn.
+
+        The companion attaches its unified-profile DTO onto the event during
+        the message-event stage, which always precedes this on_llm_request
+        handler; a missing DTO just degrades to a no-op inside the service.
+        """
+        try:
+            service = getattr(self.memory_engine, "portrait_service", None)
+            if service is None:
+                return
+            scope = resolve_turn_scope(event, is_group=is_group)
+            spawn_portrait_capture(
+                get_active_plugin(),
+                service,
+                text=text,
+                session_id=session_id,
+                scope=scope,
+                event=event,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[{session_id}] 画像采集调度失败: {exc}")
+
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
         """Query and inject long-term memory before LLM request"""
         try:
@@ -210,6 +237,13 @@ class MemoryRecall:
                         content=message_to_store,
                     )
                     await self.message_utils.enforce_message_limit(session_id)
+
+                # REQ-036 画像采集：纯规则正则陈述提取，零 LLM，后台任务不占请求路径。
+                # PC 在消息事件阶段把 unified profile DTO setattr 到 event 上，
+                # 本阶段（on_llm_request）必定可见；DTO 缺失时服务自行降级。
+                await self._capture_portrait_turn(
+                    event, session_id, actual_query, is_group
+                )
 
                 # 若 top_k <= 0，跳过记忆检索和注入，但上述清理和消息存储已执行
                 top_k = self.config_manager.get("recall_engine.top_k", 5)

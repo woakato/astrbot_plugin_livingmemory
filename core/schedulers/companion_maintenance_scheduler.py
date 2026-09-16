@@ -114,7 +114,7 @@ class CompanionMaintenanceScheduler:
         if store is None:
             return {"skipped": 1}
 
-        result = {"purged": 0, "distilled": 0, "aged_out": 0}
+        result = {"purged": 0, "distilled": 0, "aged_out": 0, "portrait": 0}
         # Distill before purge: purge_expired removes acked rows past the
         # retention window, which are exactly what the distiller reads.
         try:
@@ -132,10 +132,37 @@ class CompanionMaintenanceScheduler:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[陪伴维护] 未闭环老化失败: {exc}")
 
+        try:
+            result["portrait"] = await self._run_portrait_batches()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[陪伴维护] 画像批处理失败: {exc}")
+
         if any(result.values()):
             logger.info(f"[陪伴维护] {reason}: {result}")
         self._last_run_date = today
         return result
+
+    async def _run_portrait_batches(self) -> int:
+        """Nightly REQ-036 promotion pass over people with pending evidence.
+
+        Goes through the portrait service so configured thresholds apply
+        (the batch itself is pure distinct-evidence counting, no LLM);
+        per-person daily attempt/success caps make repeated calls cheap.
+        Returns promoted-fact count.
+        """
+        portrait_store = getattr(self.memory_engine, "portrait_store", None)
+        service = getattr(self.memory_engine, "portrait_service", None)
+        if portrait_store is None or service is None:
+            return 0
+        people = await portrait_store.list_pending_people(limit=50)
+        promoted = 0
+        for person_id in people:
+            outcome = await service.run_daily_batch(
+                person_id, run_day=datetime.now().strftime("%Y-%m-%d")
+            )
+            if outcome.get("created"):
+                promoted += int(outcome.get("created") or 0)
+        return promoted
 
     async def _distill_emotions(self, store) -> int:
         """Turn weighty acked afterglows into durable memories.

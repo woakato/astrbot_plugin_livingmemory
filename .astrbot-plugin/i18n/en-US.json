@@ -552,6 +552,34 @@
         "description": "State-chat time window",
         "hint": "Current-state chat keeps only recent memories within this many hours."
       }
+    },
+    "portrait": {
+      "description": "User portrait (REQ-036)",
+      "hint": "Rule-based extraction of stable preferences from first-person statements (pure regex, no LLM). Needs the companion plugin link to have a data source; off by default.",
+      "enabled": {
+        "description": "Enable portrait",
+        "hint": "When on, every message runs a zero-cost rule extractor; portrait data stores only hash evidence and short summaries. When off, the whole portrait surface degrades to unavailable."
+      },
+      "min_independent_evidence": {
+        "description": "Intelligent portrait evidence threshold",
+        "hint": "A portrait conclusion needs at least this many deduplicated independent statements to be promoted to inferred. (Allowed range: 1-16)"
+      },
+      "usage_min_confidence": {
+        "description": "Usage confidence floor",
+        "hint": "Portrait items below this confidence are not offered to the companion plugin. (Allowed range: 0-1)"
+      },
+      "inferred_freshness_days": {
+        "description": "Inferred freshness days",
+        "hint": "Inferred portrait items older than this many days stop being used."
+      },
+      "daily_success_limit_per_person": {
+        "description": "Daily success cap per person",
+        "hint": "Max inferred promotions per person per day."
+      },
+      "daily_attempt_limit_per_person": {
+        "description": "Daily attempt cap per person",
+        "hint": "Includes failure backoff, prevents repeated nightly rescans of one person."
+      }
     }
   }
 }

@@ -1343,6 +1343,113 @@ class CompanionBridge:
     ) -> dict[str, Any]:
         return {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
 
+    # ------------------------------------------------------------------
+    # portrait surface (REQ-036; spec §13). Shapes mirror MC's bridge
+    # read_unified_profile_portrait / unified_profile_portrait_status /
+    # run_unified_profile_portrait_batch: when the service is absent
+    # (feature switch off or bridge disabled) they degrade to honest
+    # bridge_unavailable codes, which the companion already tolerates.
+    # ------------------------------------------------------------------
+
+    def _portrait_service(self) -> Any:
+        if self._disabled():
+            return None
+        engine = self._engine()
+        return getattr(engine, "portrait_service", None) if engine else None
+
+    async def read_unified_profile_portrait(
+        self, request: Any = None, *, limit: int = 8
+    ) -> dict[str, Any]:
+        base = {
+            "ok": False,
+            "read_only": True,
+            "code": "bridge_unavailable",
+            "items": [],
+        }
+        service = self._portrait_service()
+        if service is None:
+            return base
+        try:
+            result = await service.read_summary(
+                request if isinstance(request, dict) else {},
+                limit=max(1, min(16, int(limit))),
+            )
+        except Exception:  # noqa: BLE001
+            return {**base, "code": "bridge_degraded"}
+        if not isinstance(result, dict):
+            return {**base, "code": "bridge_degraded"}
+        # Second-layer low-sensitivity filter mirroring MC: nothing leaves
+        # the bridge surface unless explicitly labelled low.
+        raw_items = result.get("items")
+        items: list[dict[str, Any]] = []
+        for item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("sensitivity") or "")[:24] != "low":
+                continue
+            items.append(
+                {
+                    "dimension": str(item.get("dimension") or "")[:80],
+                    "summary": str(item.get("summary") or "")[:180],
+                    "portrait_tier": str(item.get("portrait_tier") or "")[:24],
+                    "epistemic_status": str(item.get("epistemic_status") or "")[:40],
+                    "confidence": float(item.get("confidence") or 0),
+                    "updated_at": str(item.get("updated_at") or "")[:80],
+                }
+            )
+        return {
+            "ok": bool(result.get("ok")),
+            "read_only": True,
+            "code": str(result.get("code") or "bridge_degraded")[:80],
+            "items": items,
+            "portrait_revision": int(result.get("portrait_revision") or 0),
+        }
+
+    async def unified_profile_portrait_status(
+        self, person_id: Any = ""
+    ) -> dict[str, Any]:
+        fallback = {
+            "ok": False,
+            "read_only": True,
+            "code": "bridge_unavailable",
+            "last_synced_at": "",
+            "portrait_revision": 0,
+        }
+        service = self._portrait_service()
+        if service is None:
+            return fallback
+        try:
+            result = await service.status(str(person_id or ""))
+        except Exception:  # noqa: BLE001
+            return {**fallback, "code": "bridge_degraded"}
+        if not isinstance(result, dict):
+            return {**fallback, "code": "bridge_degraded"}
+        return {
+            "ok": bool(result.get("ok")),
+            "read_only": True,
+            "code": str(result.get("code") or "bridge_degraded")[:80],
+            "last_synced_at": str(result.get("last_synced_at") or "")[:80],
+            "portrait_revision": int(result.get("portrait_revision") or 0),
+        }
+
+    async def run_unified_profile_portrait_batch(
+        self, person_id: Any = "", *, run_day: str = ""
+    ) -> dict[str, Any]:
+        service = self._portrait_service()
+        if service is None:
+            return {"ok": False, "code": "bridge_unavailable"}
+        try:
+            result = await service.run_daily_batch(
+                str(person_id or ""), run_day=str(run_day or "")
+            )
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "code": "bridge_degraded"}
+        return (
+            dict(result)
+            if isinstance(result, dict)
+            else {"ok": False, "code": "bridge_degraded"}
+        )
+
 
 def bot_self_id(bot_id: str) -> str:
     """Fallback sender id for bot-authored mirrored turns."""

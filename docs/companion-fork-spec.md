@@ -206,7 +206,7 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 
 ## 12. 实施状态（fork-dev 分支，2026-09-16）
 
-已完成并验证（本地测试 804/804 全绿（774 原有 + 30 companion 桥接套件）；提交见 git log）：
+已完成并验证（本地测试 816/816 全绿（774 原有 + 30 companion 桥接套件 + 12 画像套件）；提交见 git log）：
 - [x] Phase 0 身份：metadata version=3.0.0、display_name=我会牢牢记住你；main.py 模块级 get_active_bridge/get_memory_companion_bridge + 类上 staticmethod 钩子 + terminate 收口。
 - [x] Phase 1a 契约：三份逐字复制（gitattributes 锁 LF；git blob==MC 原件 sha256 三方一致，验证过防 ruff 误改）。
 - [x] Phase 1b 桥：core/companion/bridge.py——握手（模拟 PC 比较逻辑零 mismatch）、compose_context（判废句形状正确）、record_*（幂等键+异步落库）、情绪六法（fail-closed 域校验、peek 与 deliver 分离）、defer/coordination/open_loops/relationship 形状、terminate 令牌轮换。
@@ -239,6 +239,44 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 - bridge 的 _record/_afterglow_line 全部只读或异步，关键路径零阻塞。
 
 待办：
-- [ ] Phase 5 画像（默认关，独立开关 portrait.enabled=false 尚未进 schema——实现时一并加）。
-- [ ] 联机验收：禁用 MC → 启用 LM 3.0 → 按 §9 清单逐项过。
+- [x] Phase 5 画像（见 §13，默认关；schema portrait 段已落地）。
+- [ ] 联机验收：禁用 MC → 启用 LM 3.0 → 按 §9 清单逐项过 + §13 画像联机步骤。
 - [ ] 上游更新时 rebase：git fetch origin && git log origin/master..fork-dev 对照。
+
+## 13. Phase 5 用户画像（REQ-036，默认关）
+
+### 13.1 研究结论（子代理全量走查，2026-09-17）
+
+1. **画像管道零 LLM**：MC 的画像（portrait.py / profile_quality.py / store 画像区）完全是正则第一人称陈述提取 + SHA256 证据哈希 + 夜间批"独立表述计数"（≥min_independent_evidence 条去重后的不同表述才升级为 `可能×××` 推断层）。`portrait.token_budget_*` 配置是预留死键，无任何代码读取。"受制于模型能力"的原假设不成立；真实特性是召回保守（提不到就空，不会出坏数据）。
+2. **PC 消费面承重方法只有一个**：`read_unified_profile_portrait(request, limit)`——缺失它 PC 会强制 `portrait_mode=disabled`（unified_profile_service.py:296-301）并失去称呼偏好覆盖、群自述回复、管理页预览。其余画像相关探针（`unified_profile_portrait_status`、`read_user_memory_summary`、`peek_relationship_phase`）均为管理页展示，可诚实降级。
+3. **契约必须用 MC 版**（`unified_profile_contract.py`）：PC 构建画像读请求时会注入额外键 `namespace_context`，PC 版自带的 `validate_portrait_request` 是"恰好9键"严格校验会直接拒死，MC 版是宽容子集校验，与 PC 生产端兼容。两版指纹同为 `72067a45012a0588`（PC 侧比对的是常量值不是文件字节），握手不受影响。
+4. **DTO 挂载时机**：PC 在消息事件阶段（message_pipeline.py:139 私聊 / main.py:21392 群聊唤醒轮）裸 `setattr(event, "private_companion_unified_profile_context", dto)`，先于 LM 的 on_llm_request——fork 用 getattr 优先+get_extra 兜底读取（与 defer 通道同一教训）。群聊**未唤醒**消息走 LM 被动捕获通道，运行于 custom_filter 阶段早于 PC 的组处理器，DTO 必不在——故画像采集统一放在召回处理器内（覆盖私聊+唤醒群聊轮），MC 自己同样只在请求路径采集（service.py:1166），语义对齐。
+5. **REQ-041 命名空间不实现**：PC 只有 REQ-041 握手成功（`namespace_negotiated`）才会把 `namespace_context` 塞进画像请求；fork 不宣告该面，读请求就不会带命名空间，走官方 legacy 回退（MC 自己的 `portrait_namespace_legacy` 语义）。capture 侧同理：PC 挂了 DTO 但不带 namespace 上下文时 fork 按 `private` / `group:<platform>:<gid>` 原样落桶。
+
+### 13.2 落地组成
+
+- `core/companion/contracts/unified_profile_contract.py`、`contracts/sensitive_data.py`：逐字节拷贝（sha256 已验证一致；`.gitattributes` eol=lf 覆盖 contracts/*.py）。ruff 永不碰 contracts 目录。
+- `core/companion/profile_quality.py`：MC 同名文件逐字节拷贝（纯 stdlib 规则提取器 rule_v2），但**位于 contracts 之外**——它是可改的移植件，不是握手契约。
+- `core/companion/portrait_rules.py`：MC core/portrait.py 的规则移植（import 接线改为 fork 内路径 + 内联 5 行 clean_text；规则逻辑逐行等同）。
+- `core/companion/portrait_service.py`：MC PortraitService 移植 + fork 的 getattr 优先 DTO 读取 + legacy-only 命名空间决策（注释说明 REQ-041 落地的重审点）。`resolve_turn_scope`/`spawn_portrait_capture` 为共享入口函数。
+- `storage/portrait_store.py`：PortraitStore（7 张 MC 画像表，短连接 WAL 模式，asyncio.Lock 串行写）；夜间批在独立连接上跑 + busy_timeout 互不阻塞。
+- 引擎接线：`memory_engine.portrait_store/portrait_service`，config 键 `portrait_enabled` + 扁平 `portrait` 段（finalize 映射，默认关）。
+- 捕获钩子：`memory_recall._capture_portrait_turn`（消息入库后、闸门判断前；短文本/斜杠命令跳过，后台 spawn 不占请求路径）。
+- 夜间批：`CompanionMaintenanceScheduler.run_once` 新增 `_run_portrait_batches`（pending 人群逐人 batch，日限自限流）。
+- 桥面：`read_unified_profile_portrait` / `unified_profile_portrait_status` / `run_unified_profile_portrait_batch`（形状镜像 MC bridge.py:1387-1455，含 low 二层过滤；`_portrait_service()` 走统一 `_disabled()` 门）。
+
+### 13.3 安全不变式（有测试锁定）
+
+- 原文不落画像表：evidence 只存哈希（test_capture_stores_no_raw_text）；claim_summary 作为"结论"允许携带提取值（与 MC 一致）。
+- 读路径全 fail-closed：无 DTO/无授权/非 active 身份/stale 修订/第三方可见目的/低敏之外/置信度低于 0.75/推断超 90 天/被压制——每一条独立否决（test_capture_requires_dto_and_grant、test_read_denies_*、test_suppression_blocks_write_and_read、test_usage_disabled_*）。
+- 单值维度（叫我X/生日/职业…）新声明自动 supersede 旧值（test_single_value_dimension_supersedes_previous）。
+- 任何凭据形状的串在写库前被 redact_sensitive_value 洗掉（拷贝件行为）。
+- 每日批自限：每人的 attempt/success 上限落 portrait_daily_runs，重复调用只回 portrait_daily_limit（test_batch_requires_distinct_statements）。
+
+### 13.4 已知降级面（v1 刻意不做）
+
+- 群聊未唤醒消息不做画像采集（原因见 13.1.4；需要画像的群场景建议用唤醒轮即可）。
+- 不做画像管理页 / 治理面（suppress/revoke 仅经内部接口，PC 管理页的画像面板走 read 方法不受影响）。
+- `get_relationship_phase` 维持 unknown 诚实形状；`consume_relationship_projection` 不实现——PC 侧用 `callable()` 探针守护（memory_companion_adapter.py:2497），缺方法即静默跳过，已核实无 TypeError 路径。
+- REQ-041 命名空间精确隔离（digest 分桶）未移植；将来实现 scoped-erase 面时一并重审 `_namespace_decision`。
+
