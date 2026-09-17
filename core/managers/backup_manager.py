@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,10 @@ _VERSION_FILE = ".plugin_version"
 _BACKUP_INFO_FILE = "backup_info.json"
 
 # Files/patterns to include in a full backup (relative to data_dir).
+# NOTE: *.db-wal / *.db-shm are deliberately absent. They are not standalone
+# artifacts — a consistent database snapshot comes from SQLite's online backup
+# API (see _backup_one), which reads through the WAL. Copying the -wal/-shm
+# files separately could pair an old main file with a newer WAL.
 _BACKUP_PATTERNS: list[str] = [
     "livingmemory.db",
     "livingmemory.index",
@@ -30,8 +35,6 @@ _BACKUP_PATTERNS: list[str] = [
     "livingmemory_graph.index",
     "conversations.db",
     "decay_state.json",
-    "*.db-wal",
-    "*.db-shm",
 ]
 
 
@@ -83,15 +86,17 @@ class BackupManager:
         )
 
         copied_count = 0
+        failed: list[str] = []
         for pattern in _BACKUP_PATTERNS:
             for file_path in self.data_dir.glob(pattern):
                 if not file_path.is_file():
                     continue
                 dest = backup_dir / file_path.name
                 try:
-                    shutil.copy2(file_path, dest)
+                    self._backup_one(file_path, dest)
                     copied_count += 1
-                except OSError as exc:
+                except (OSError, sqlite3.Error) as exc:
+                    failed.append(file_path.name)
                     logger.error(
                         f"[BackupManager] 备份文件失败 {file_path.name}: {exc}"
                     )
@@ -103,6 +108,7 @@ class BackupManager:
             "backup_timestamp": datetime.now(timezone.utc).isoformat(),
             "backup_unix_time": time.time(),
             "files_copied": copied_count,
+            "files_failed": failed,
             "data_dir": str(self.data_dir),
         }
         info_path = backup_dir / _BACKUP_INFO_FILE
@@ -119,6 +125,35 @@ class BackupManager:
     async def backup_if_needed_async(self) -> str | None:
         """异步版本：通过 asyncio.to_thread 将同步文件 I/O 卸载到线程池。"""
         return await asyncio.to_thread(self.backup_if_needed)
+
+    @staticmethod
+    def _backup_one(source: Path, dest: Path) -> None:
+        """Copy one data file, using SQLite's online backup API for databases.
+
+        ``shutil.copy2`` on a live SQLite database can capture a torn page set
+        (no checkpoint, no lock), and the version-change backup is exactly the
+        safety net a failed upgrade falls back to — so it must be consistent.
+        ``Connection.backup`` snapshots the database through the WAL while
+        writers keep running. Non-SQLite files keep the plain copy.
+        """
+        if source.suffix == ".db":
+            try:
+                src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+                try:
+                    out = sqlite3.connect(str(dest))
+                    try:
+                        src.backup(out)
+                    finally:
+                        out.close()
+                finally:
+                    src.close()
+                return
+            except sqlite3.Error as exc:
+                logger.warning(
+                    f"[BackupManager] SQLite 在线备份失败，回退为文件复制 "
+                    f"{source.name}: {exc}"
+                )
+        shutil.copy2(source, dest)
 
     # ------------------------------------------------------------------
     # Utilities

@@ -363,6 +363,98 @@ class MemoryConsolidationConfig(BaseModel):
     )
 
 
+class CompanionBridgeConfig(BaseModel):
+    """companion 桥接兼容层配置（交接文档 §7）"""
+
+    enabled: bool = Field(default=True, description="是否启用 companion 桥接面")
+    schedule_fast_context_enabled: bool = Field(
+        default=True, description="是否注入日程类快速上下文"
+    )
+    outfit_fast_context_enabled: bool = Field(
+        default=True, description="是否注入穿搭类快速上下文"
+    )
+    dedupe_prompt_context: bool = Field(
+        default=True, description="是否对 companion 上下文去重"
+    )
+    prefer_memory_companion_memory: bool = Field(
+        default=True, description="冲突时是否优先采用 companion 侧记忆"
+    )
+    clean_proactive_history: bool = Field(
+        default=True, description="是否清理主动消息历史"
+    )
+    suppress_self_timeline_when_companion_seen: bool = Field(
+        default=True, description="companion 已在场时不再注入自身时间线"
+    )
+    suppress_user_context_when_companion_seen: bool = Field(
+        default=True, description="companion 已在场时不再注入用户画像"
+    )
+    cross_window_emotional_continuity_enabled: bool = Field(
+        default=False, description="是否启用跨窗口情绪连续性"
+    )
+
+
+class CoreMemoryConfig(BaseModel):
+    """常驻核心记忆配置"""
+
+    enabled: bool = Field(default=True, description="是否启用常驻核心记忆")
+    max_blocks: int = Field(
+        default=8, ge=1, le=16, description="单轮最多注入的核心记忆条数"
+    )
+    max_chars: int = Field(
+        default=800, ge=200, le=2000, description="核心记忆注入的字符预算"
+    )
+
+
+class CompanionSlotsConfig(BaseModel):
+    """companion 上下文槽位配置"""
+
+    budget_chars: int = Field(
+        default=1000, ge=300, le=3000, description="槽位注入的总字符预算"
+    )
+    gate_enabled: bool = Field(default=True, description="是否启用注入闸门判定")
+    enable_core_block: bool = Field(default=True, description="是否注入常驻核心记忆块")
+    enable_mood_line: bool = Field(default=True, description="是否注入情绪余波行")
+    enable_relationship_line: bool = Field(
+        default=True, description="是否注入关系进度行"
+    )
+    enable_open_loops: bool = Field(default=True, description="是否注入未闭环话题")
+    enable_self_line: bool = Field(default=True, description="是否注入自身行程行")
+    enable_raw_quote: bool = Field(
+        default=True, description="时间敏感记忆是否允许以原文替代转述"
+    )
+    enable_package: bool = Field(default=True, description="是否启用 PackageComposer 装箱")
+    state_guard_hours: float = Field(
+        default=6.0, ge=0.5, le=48.0, description="状态守卫的时效窗口（小时）"
+    )
+
+
+class PortraitConfig(BaseModel):
+    """用户画像采集配置"""
+
+    enabled: bool = Field(default=False, description="是否启用用户画像采集")
+    min_independent_evidence: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="一条画像候选提升为稳定事实所需的独立证据数",
+    )
+    usage_min_confidence: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="画像事实参与注入所需的最低置信度",
+    )
+    inferred_freshness_days: int = Field(
+        default=90, ge=7, le=365, description="推断型事实的有效期（天）"
+    )
+    daily_success_limit_per_person: int = Field(
+        default=1, ge=0, le=20, description="每人每日成功提升的上限"
+    )
+    daily_attempt_limit_per_person: int = Field(
+        default=2, ge=0, le=50, description="每人每日提升尝试的上限"
+    )
+
+
 class LivingMemoryConfig(BaseModel):
     """完整插件配置"""
 
@@ -392,6 +484,18 @@ class LivingMemoryConfig(BaseModel):
     )
     memory_consolidation: MemoryConsolidationConfig = Field(
         default_factory=MemoryConsolidationConfig, description="记忆库定期整合配置"
+    )
+    companion_bridge: CompanionBridgeConfig = Field(
+        default_factory=CompanionBridgeConfig, description="companion 桥接兼容层配置"
+    )
+    companion_slots: CompanionSlotsConfig = Field(
+        default_factory=CompanionSlotsConfig, description="companion 上下文槽位配置"
+    )
+    core_memory: CoreMemoryConfig = Field(
+        default_factory=CoreMemoryConfig, description="常驻核心记忆配置"
+    )
+    portrait: PortraitConfig = Field(
+        default_factory=PortraitConfig, description="用户画像采集配置"
     )
 
     model_config = {"extra": "allow"}  # 允许额外字段，向前兼容

@@ -8,9 +8,14 @@ Runs daily at a fixed hour (mirrors DecayScheduler's loop style):
   add_memory so BM25/FAISS/graph all index them properly;
 - age out stale open loops that never received a resolution (older than
   OPEN_LOOP_MAX_AGE_DAYS without a future due_ts are no longer worth
-  asking about).
+  asking about);
+- weekly (gated inside the daily pass) distill "weighty" diary entries into
+  durable long-term memories. Raw diary rows stay in the window index; only
+  substantial ones are promoted, and the promoted row is tagged
+  ``visibility=bot_self`` so the recall side can keep it out of user/group
+  recall. Schedule archives are deliberately excluded (spec §0: 日程永不进总结).
 
-Spec: docs/companion-fork-spec.md section 10 (Phase 4).
+Spec: docs/companion-fork-spec.md section 10 (Phase 4) + §0 数据分诊.
 """
 
 from __future__ import annotations
@@ -22,11 +27,20 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
+from ...storage.companion_store import DIARY_ARCHIVE_MEMORY_TYPES
+
 if TYPE_CHECKING:
     from ..managers.memory_engine import MemoryEngine
 
 OPEN_LOOP_MAX_AGE_DAYS = 45
 _MIN_DISTILL_INTENSITY = 40.0
+
+#: 日记"有分量"的内容长度门槛。归档行只保留 summary（PC 侧截断到 360 字符），
+#: payload 里的 mood/tags/dream_summary 不会落库，所以长度是唯一可用的判据。
+MIN_DIARY_DISTILL_CHARS = 80
+
+#: 日记蒸馏按周执行（在每日巡检里做时间门），与情绪蒸馏同属"反思期"动作。
+_DIARY_DISTILL_INTERVAL_SECONDS = 7 * 24 * 3600
 
 _EVENT_PHRASES = {
     "scar_touched": "被提起旧伤，留下了痕迹",
@@ -61,6 +75,8 @@ class CompanionMaintenanceScheduler:
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_run_date: str = ""
+        # 日记蒸馏按周；0 表示还没跑过（首轮即执行一次）。
+        self._last_diary_distill_at: float = 0.0
 
     async def start(self) -> None:
         if self._running:
@@ -114,13 +130,21 @@ class CompanionMaintenanceScheduler:
         if store is None:
             return {"skipped": 1}
 
-        result = {"purged": 0, "distilled": 0, "aged_out": 0, "portrait": 0}
+        result = {"purged": 0, "distilled": 0, "aged_out": 0, "portrait": 0, "diary": 0}
         # Distill before purge: purge_expired removes acked rows past the
         # retention window, which are exactly what the distiller reads.
         try:
             result["distilled"] = await self._distill_emotions(store)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[陪伴维护] 情绪蒸馏失败: {exc}")
+
+        # 日记蒸馏：按周门控（每日巡检里做时间判断），与情绪蒸馏同属反思期动作。
+        if time.time() - self._last_diary_distill_at >= _DIARY_DISTILL_INTERVAL_SECONDS:
+            try:
+                result["diary"] = await self._distill_diaries(store)
+                self._last_diary_distill_at = time.time()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[陪伴维护] 日记蒸馏失败: {exc}")
 
         try:
             result["purged"] = await store.purge_expired()
@@ -216,6 +240,56 @@ class CompanionMaintenanceScheduler:
                 logger.warning(f"[陪伴维护] 单条蒸馏失败({event_id}): {exc}")
         if processed_ids:
             await store.mark_distilled(processed_ids)
+        return distilled
+
+    async def _distill_diaries(self, store) -> int:
+        """每周把"有分量"的日记升华为长期记忆（spec §0 分诊表）。
+
+        原始日记条目留在 companion_events（窗口索引，不进总结）；这里只把内容
+        足够长的条目 add_memory 进长期库，并打 ``visibility=bot_self`` 标记——
+        读侧据此把 bot 自述内容挡在用户/群聊召回之外。
+
+        日程归档（bot_schedule_plan / bot_window_snapshot /
+        bot_schedule_reconciliation）**不会**被匹配到：它们与日记共用
+        ``kind='archive'``，只有 ``archive_memory_type`` 能区分。
+        """
+        rows = await store.list_undistilled_diaries(
+            memory_types=tuple(sorted(DIARY_ARCHIVE_MEMORY_TYPES)), limit=20
+        )
+        if not rows:
+            return 0
+        distilled = 0
+        processed: list[str] = []
+        for row in rows:
+            event_key = str(row.get("event_key") or "")
+            try:
+                content = str(row.get("content") or "").strip()
+                if len(content) < MIN_DIARY_DISTILL_CHARS:
+                    # 分量不足：标记跳过，避免每周重复扫同一批空条目。
+                    processed.append(event_key)
+                    continue
+                metadata = row.get("metadata") or {}
+                day = str(metadata.get("date") or "")
+                await self.memory_engine.add_memory(
+                    content=f"（人生片段）{content}",
+                    session_id=None,
+                    importance=0.6,
+                    metadata={
+                        "memory_type": "EPISODIC",
+                        "visibility": "bot_self",
+                        "diary_distilled": True,
+                        "source_diary_date": day,
+                        "source_event_key": event_key,
+                    },
+                    preserve_create_time=True,
+                )
+                distilled += 1
+                processed.append(event_key)
+            except Exception as exc:  # noqa: BLE001
+                # 写入失败不标记：留待下次重试。
+                logger.warning(f"[陪伴维护] 日记蒸馏失败({event_key}): {exc}")
+        if processed:
+            await store.mark_diaries_distilled(processed)
         return distilled
 
     async def _age_out_open_loops(self) -> int:

@@ -651,6 +651,11 @@
         "description": "状态闲聊时间窗",
         "hint": "状态类闲聊只保留该小时数内的近期记忆。",
         "type": "float",
+        "slider": {
+          "min": 0.5,
+          "max": 48,
+          "step": 0.5
+        },
         "default": 6.0
       }
     }
@@ -670,30 +675,55 @@
         "description": "智能画像证据阈值",
         "hint": "同一画像结论需要至少几条去重后的独立表述才升级为推断画像。（允许范围：1–16）",
         "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 10,
+          "step": 1
+        },
         "default": 3
       },
       "usage_min_confidence": {
         "description": "使用置信度下限",
         "hint": "低于此置信度的画像条目不会提供给陪伴插件。（允许范围：0–1）",
         "type": "float",
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        },
         "default": 0.75
       },
       "inferred_freshness_days": {
         "description": "推断保鲜天数",
         "hint": "超过该天数的推断画像自动停用。",
         "type": "int",
+        "slider": {
+          "min": 7,
+          "max": 365,
+          "step": 7
+        },
         "default": 90
       },
       "daily_success_limit_per_person": {
         "description": "单人每日成功上限",
         "hint": "每人每天最多成功升级几条推断画像。",
         "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        },
         "default": 1
       },
       "daily_attempt_limit_per_person": {
         "description": "单人每日尝试上限",
         "hint": "含失败退避，防止每晚对同一人反复重扫。",
         "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        },
         "default": 2
       }
     }

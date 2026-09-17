@@ -303,10 +303,25 @@ class CommandHandler:
                 priority = max(0, min(100, int(options.get("priority", "50"))))
             except ValueError:
                 priority = 50
-            session_id = None
+            # Resolve the domain keys exactly like the recall path does, so the
+            # new block is actually loadable by later turns. A scoped block
+            # whose domain key was never recorded is unreachable forever:
+            # load_core_memories is fail-closed.
+            session_id = persona_id = None
+            user_id = ""
             if scope == "session":
                 session_id = resolve_memory_scope(self.config_manager, event) \
                     or event.unified_msg_origin
+            elif scope == "persona":
+                from .utils import get_persona_id
+
+                persona_id = await get_persona_id(self.context, event)
+            elif scope == "user":
+                try:
+                    user_id = str(event.get_sender_id() or "")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"读取发送者 ID 失败，scope=user 无法确定域键: {exc}")
+                    user_id = ""
             try:
                 memory_id = await self.memory_engine.add_core_memory(
                     content,
@@ -315,9 +330,18 @@ class CommandHandler:
                     priority=priority,
                     scope=scope,
                     session_id=session_id,
+                    persona_id=persona_id,
+                    user_id=user_id,
                 )
                 yield event.plain_result(
                     t("core.add_success", id=memory_id, label=label or "-")
+                )
+            except ValueError as exc:
+                # Domain key missing / bad scope: a user-fixable input problem,
+                # not an internal failure — log it without a stack trace.
+                logger.warning(f"添加核心记忆被拒绝: {exc}")
+                yield event.plain_result(
+                    self._format_error_message(t("core.action_name"), exc)
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"添加核心记忆失败: {exc}", exc_info=True)

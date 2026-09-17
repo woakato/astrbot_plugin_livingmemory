@@ -107,7 +107,11 @@ async def compose_context(*, query="", session_context=None, top_k=None, max_cha
 | affect_modulation.py | core/affect_modulation.py | "affect_modulation.v1", fingerprint=sha256(fields)[:20] |
 
 不复制：person_context_contract / scoped_domain_contract / namespace / namespace_capability / p6_four_package_manifest（绑定未实现的投影/REQ-041 面）。v1 不申报 scoped capability → PC negotiate 失败自动 local，无需文件。
-PC 测试基线：test_c1_contract.py 字节比对 + 冻结断言——我们不动 PC，只是自证复制正确：fork 启动时 import 自己的三份文件跑 self_check()（指纹/重复 slug/类型同步/窗口覆盖/别名），任一失败 → companion_bridge 置不可用（返回 available=False），握手自然不通过。
+PC 测试基线：test_c1_contract.py 字节比对 + 冻结断言——我们不动 PC，只是自证复制正确：fork 启动时 `CompanionBridge.__init__` 对四份 vendored 契约逐个跑 `contract_self_check()`（指纹/重复 slug/类型同步/窗口覆盖/别名），任一失败 → companion_bridge 置不可用（`_disabled()` 为真，probe 返回 `available=False`），握手自然不通过。
+
+> **实现修正（2026-09-17 审计）**：实际只有 `bot_personal_contract.py` 与 `unified_profile_contract.py` 暴露 `contract_self_check()`；
+> `emotion_event_contract.py`、`affect_modulation.py` 无同名函数（属 vendored 副本原样，不加自检）。启动检查遍历四份但跳过无自检者，
+> 不再宣称"三份都跑"。诊断面：`CompanionBridge.contract_health()`（新增，已从 probe 的 `methods` 列表中排除，不影响握手载荷体积与内容）。
 
 ## 5. LM 改造点（行号基于 2.7.0-beta.1，即备份目录一致）
 
@@ -168,11 +172,15 @@ CREATE TABLE IF NOT EXISTS emotion_ledger (
 
 ## 7. 配置（_conf_schema.json 新段 + config_validator.py BaseModel 节；extra:allow 兜底、点号 get）
 
-- `companion_bridge`: enabled(true), schedule_fast_context_enabled(true), outfit_fast_context_enabled(true), dedupe_prompt_context(true), prefer_memory_companion_memory(true), clean_proactive_history(true), suppress_self_timeline_when_companion_seen(true), suppress_user_context_when_companion_seen(true), cross_window_emotional_continuity_enabled(false), legacy_emotion_compatibility_enabled(true)
-- `core_memory`: enabled(true), llm_management_enabled(true), max_blocks(8), max_chars(800)
-- `companion_slots`: budget_chars(1000), gate_enabled(true), enable_core_block(true), enable_mood_line(true), enable_relationship_line(true), enable_open_loops(true), enable_self_line(true), enable_raw_quote(true)
-- `portrait`: **enabled(false)**, direct_evidence_only(true), window_start(3), window_end(5), min_independent_evidence(2), daily_limit_per_person(1), max_inject(3)
-- 每节加 `config_version` 字段（LM 无配置迁移机制，自管）。
+> **键表核对（2026-09-17 审计修正）**：以下键名与默认值已与 `_conf_schema.json`、`config_validator.py` 的 `LivingMemoryConfig` 逐字对齐。此前本节列出的
+> `legacy_emotion_compatibility_enabled`、`llm_management_enabled`、`direct_evidence_only`、`window_start`/`window_end`/`max_inject`、
+> `daily_limit_per_person`、`config_version` **在代码中均不存在**，按旧表接线会踩空——请勿再依据旧表增补。
+> 4 个新段现已建模进 `LivingMemoryConfig`，因此其数值项也受"逐项钳制到最近边界 + 写回告警"约束。
+
+- `companion_bridge`: enabled(true), schedule_fast_context_enabled(true), outfit_fast_context_enabled(true), dedupe_prompt_context(true), prefer_memory_companion_memory(true), clean_proactive_history(true), suppress_self_timeline_when_companion_seen(true), suppress_user_context_when_companion_seen(true), cross_window_emotional_continuity_enabled(false)
+- `core_memory`: enabled(true), max_blocks(8, 范围 1–16), max_chars(800, 范围 200–2000)
+- `companion_slots`: budget_chars(1000, 300–3000), gate_enabled(true), enable_core_block(true), enable_mood_line(true), enable_relationship_line(true), enable_open_loops(true), enable_self_line(true), enable_raw_quote(true), enable_package(true), state_guard_hours(6.0, 0.5–48)
+- `portrait`: **enabled(false)**, min_independent_evidence(3, 1–10), usage_min_confidence(0.75, 0–1), inferred_freshness_days(90, 7–365), daily_success_limit_per_person(1, 0–20), daily_attempt_limit_per_person(2, 0–50)
 - backup_settings 默认保持开（MC 教训）。
 
 ## 8. 时间/ID/编码约定
@@ -206,8 +214,15 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 
 ## 12. 实施状态（fork-dev 分支，2026-09-16）
 
-已完成并验证（本地测试 816/816 全绿（774 原有 + 30 companion 桥接套件 + 12 画像套件）；提交见 git log）：
-- [x] Phase 0 身份：metadata version=3.0.0、display_name=我会牢牢记住你；main.py 模块级 get_active_bridge/get_memory_companion_bridge + 类上 staticmethod 钩子 + terminate 收口。
+已完成并验证（本地测试**全绿**；提交见 git log）。
+
+> **测试数字核对（2026-09-17 审计实测）**：以 `AstrBot-master/.venv` + pytest 实跑
+> `pytest tests/ -q` 得 **819 passed / 0 failed（33.8s）**，收集 819 例。
+> 此前本节先后写作"816/816"与"804/804"两处互不一致，且均与实测不符——现已改为以实测为准：
+> 全量 **819**，其中 `test_companion_bridge.py` **30 例**、`test_portrait.py` **15 例**、`test_main_tools.py` **9 例**。
+> 注：pytest 收集数 ≠ test 函数个数（`parametrize` 会展开），统计请以收集器输出为准。
+
+- [x] Phase 0 身份：metadata version=3.0.0、display_name=我会牢牢记住你（**有意为之**——借桥接握手让 AstrBot 把本插件识别为 memory_companion 的一次版本更新，见决策 §0；不是版本号误改）；main.py 模块级 get_active_bridge/get_memory_companion_bridge + 类上 staticmethod 钩子 + terminate 收口。
 - [x] Phase 1a 契约：三份逐字复制（gitattributes 锁 LF；git blob==MC 原件 sha256 三方一致，验证过防 ruff 误改）。
 - [x] Phase 1b 桥：core/companion/bridge.py——握手（模拟 PC 比较逻辑零 mismatch）、compose_context（判废句形状正确）、record_*（幂等键+异步落库）、情绪六法（fail-closed 域校验、peek 与 deliver 分离）、defer/coordination/open_loops/relationship 形状、terminate 令牌轮换。
 - [x] Phase 2 存储：storage/companion_store.py（companion_events + emotion_ledger + peek_pending + interaction_stats），冒烟测试过状态机（投递/签收/修订重投/过期拒签）。
@@ -217,7 +232,7 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 - [x] Phase 3d/4：core/companion/open_loop.py（纯规则承诺/待办/时间推断，含到期排序）；反思链打标；resolve_open_loops_by_text 关键词重叠消解（挂召回链）；close_stale_open_loops 45 天老化；CompanionMaintenanceScheduler（日频：purge_expired + 情绪蒸馏规则式零 LLM + 老化，finalize 接线 + stop/teardown 对称）。蒸馏/幂等/跳过行为验证过。
 - [x] Phase 6：_conf_schema.json 新段（companion_bridge/core_memory/companion_slots/agent_tools 开关）+ en/ru 前端覆盖 + zh/en/ru 后端 core 命令文案 + 版本常量 3.0.0 三处同步（backup_manager/package.json/lock，测试强制）。
 
-审计修复轮（两路子代理验收，逐条对源码复核后落地；本地测试 804/804 全绿）：
+审计修复轮（两路子代理验收，逐条对源码复核后落地；本地测试全绿——数字以 §12 开头的实测说明为准，勿再写"804/804"）：
 - [x] P1-1 核心记忆 INSERT 缺 doc_id（真 FAISS 表 NOT NULL+UNIQUE，探针复现 IntegrityError）→ 补 `core-{uuid4}`。
 - [x] P1-2 defer 读取通道错位：PC 裸 setattr 在 event/req 上，原读 get_extra 永远落空 → getattr(event)→getattr(req)→get_extra 三级回退。
 - [x] P1-3 load_core_memories fail-open：scope=session/persona/user 且当轮拿不到对应 id 时原会放行全部 → 改 fail-closed（缺域键即拒），global 不受影响。
@@ -280,6 +295,10 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 - `get_relationship_phase` 维持 unknown 诚实形状；`consume_relationship_projection` 不实现——PC 侧用 `callable()` 探针守护（memory_companion_adapter.py:2497），缺方法即静默跳过，已核实无 TypeError 路径。
 - REQ-041 命名空间精确隔离（digest 分桶）未移植；PC 只有在向记忆桥绑定命名空间迁移纪元（`bind_namespace_migration_epoch`，fork 未实现）后才会随请求附 `namespace_context`，所以 fork 部署里该值不可达、采集/读取恒在同一 legacy 桶内自洽。若日后换回 MC 接管，旧桶数据互不可见（`private` vs `private@<personaDigest>@<scopeDigest>`），需迁移。
 - 采集过滤器 `len(text)<4` 与命令前缀跳过是 fork 新增（MC 无长度门）：4 字以内第一人称声明极少（如"叫我X"3字），换取每轮热路径零开销。3 字称呼句"叫我李"会被丢弃。
+- **时间线派生内容无法携带 `visibility` 标记**（2026-09-17 补录）：说说/创作按分诊表走 时间线→总结→原子，而 `visibility=bot_self` 只存在于我们直接 `add_memory` 的条目（日记蒸馏）。被总结/原子化之后该标记不再保留，读侧过滤（`_filter_by_retrieval_policy`）因此覆盖不到它们。归属目前靠两道既有机制：镜像写入用 `role="assistant"`，且私聊总结提示词强制"以我的视角、不说 bot/助手"（`prompts/prompt_manager.py`）。**残留风险**：注入时模型仍可能把 bot 自述误当用户事实，未经实测，留待观察。
+- **日记"有分量"只能用内容长度判定**（同日补录）：归档行只保留 PC 侧的 summary（≤360 字符），payload 里的 `mood`/`tags`/`dream_summary` 不落库，`importance` 对所有归档固定 0.55。因此门槛取内容长度 `MIN_DIARY_DISTILL_CHARS`=80 字，是当前唯一可得的判据，非最优解。
+- **搜图 / 阅读 / 其它 bot 自述动作不进总结**（2026-09-17 用户确认）：`search_action` / `image_action` / `reading` 保持只进 `companion_events`（窗口索引），与日程同类处理。分诊表只列了"聊天、主动消息、说说、创作"，这三类不在其中。
+- **情绪蒸馏产物维持 `EPISODIC`**（2026-09-17 用户确认）：分诊表写"情绪类原子"，但 `AtomType` 无情绪类（只有 EPISODIC/FACTUAL/RELATIONAL/PREFERENCE/PLANNED/UNKNOWN），经确认不新增类型、不改现有类型。
 
 ### 13.5 画像审计轮（双路子代理验收，2026-09-17）
 
@@ -293,5 +312,55 @@ MC→LM 数据迁移器（库空；映射表已存档：memories→documents via
 - [x] F-04 `_namespace_decision` 注释更正：写明 MC 在带上下文时会走 exact 桶而 fork 恒 legacy，以及为何部署中不可达、换回 MC 时的桶分裂后果。
 - [x] A5 `run_daily_batch` 缺省日改用 `datetime.now().date()`（与调度器同用本地日历日；原 UTC.astimezone 写法正确但误导）。
 - [x] F-08 测试强化：指纹测试改为**加载 PC 模块重算比对**（并用双方校验器对同一 namespace_context 请求做对照断言）；supersede 断言行状态与 supersedes_id 回指；usage-disabled 精确化并新增 stale fence 对照；压制面补"写拒绝"断言；新增 attempt-cap、群作用域隔离、调度器逐人容错 3 例（15 例全绿）。
+
+## 14. 数据分诊落地（2026-09-17 第二轮）
+
+分诊表（§0）此前只落地了一部分。本轮把缺口补齐，全部按**类型分流**而不是照搬 MC——MC 是把这些一律 `insert_memory` 进长期库的，照搬会把**日程也灌进总结**，与 §0"日程永远不进总结"相反。
+
+分诊词表落在 `storage/companion_store.py`（单一事实源）：`SUMMARY_BOUND_MEMORY_TYPES` / `DIARY_ARCHIVE_MEMORY_TYPES`，bridge 与维护调度器共用。
+
+- [x] **说说 / 创作并入总结链**：`bridge._mirror_summary_bound` 在写 `companion_events` 的同时，把 `qzone_action` / `creative_work` 镜像成 `role="assistant"` 的时间线消息（自带近期同内容查重，重投不双写）。时间线 → 总结 → 原子 因此自然覆盖它们，未新增任何存储。
+- [x] **日记每周蒸馏**：`CompanionMaintenanceScheduler._distill_diaries` 在每日巡检里做 7 天时间门；只匹配 `archive_memory_type in {bot_daily_diary}`，内容长度 ≥ `MIN_DIARY_DISTILL_CHARS`(80) 的条目才 `add_memory` 升为长期记忆，并打 `visibility=bot_self` 标记；用 `metadata.diary_distilled` 防重复（无 schema 变更）。分量不足的条目也被标记跳过，避免每周重复扫。
+- [x] **读侧隔离**：`memory_engine_write_ops._filter_by_retrieval_policy` 过滤 `visibility=bot_self`，使 bot 自述内容不参与常规语义召回（MC 对应 `RetrievalPolicy.is_visible` 的 bot_self 分支）。bot 自述仍可经快线 / 自我行通道（直读 `companion_events`）出现在提示词里。
+- [x] **局面线索**：见 §13.4 与 `core/companion/situation.py`——话题类在召回链扩写检索词（带 overlap 守卫），心情/精力在桥内生成氛围行；不落库。
+- [x] 测试：新增 `tests/test_companion_data_triage.py`(10 例) 与 `tests/test_situation_clues.py`(16 例)；全量 846 passed。
+
+## 15. PC ↔ LM 职责边界核查与重复注入修复（2026-09-17 第三轮）
+
+起因：PC（`astrbot_plugin_private_companion`）自身也持久化短期/情境数据，需查清与 LM 的重叠面。**PC 侧源码不在本仓库，本节只记录与本插件相关的结论与已做的修复。**
+
+### 15.1 定性：PC 是权威写入方，本插件是投递目标（非权威库）
+PC `bot_personal_outbox.py` 模块说明原话：*"The companion plugin owns the local write. A remote MemoryCompanion Bridge is only a delivery target."*；PC 命令处理器内的边界原文：「…安装后，陪伴插件会把日程、穿搭、创作、主动消息、用户习惯等结构化反馈给记忆插件；未安装时，本地关系网、状态和短期上下文仍照常工作。」
+→ **"两边都存"是设计意图**，不是缺陷。真正要治理的是**注入方重复/空缺**，不是存储重复。
+
+### 15.2 已修：桥包重复打包未闭环（同轮出现两次）
+`bridge._compose_default_context` 原先通过 `_load_open_loops` 把未闭环塞进桥包；而 PC 在主动消息路径**已经**用专用通道 `search_open_loops` 渲染了同一批未闭环（`proactive_message.py:3537/4073`），并且本插件自己的主链注入也经 `collect_slots` 携带未闭环。结果同一批未闭环在一轮主动消息提示词里**出现两次**。
+
+- [x] 从桥包移除未闭环：`_compose_default_context` 不再调用 `_load_open_loops`，`composer.compose` 调用去掉 `open_loops=`；删除随之无用的 `_load_open_loops`。专用通道 `search_open_loops` 不变。
+- [x] 回归测试：`tests/test_companion_bridge.py::test_bridge_package_omits_open_loops_but_channel_keeps_them`（桥包不含未闭环文案，专用通道仍返回）。
+- 影响面：桥包的四个消费场景均无损——`current_state_reply` / `private_recall` 这两轮本插件主链注入仍经 slots 携带未闭环；`schedule_fast` 走快线分支；主动消息轮由 PC 自己的专用段承载。
+
+### 15.3 已核实为**误报**，不要重复怀疑
+- **"主动消息轮日程双源（PC 本地日程 vs 本插件沉淀的日程）"**：不成立。日程类只写 `companion_events`，其读取方仅 `bridge.py:509`（"今天"快线）与 `slots.py:171`（自我行），**从不进入 `search_memories` 的语义检索**；§14 的分流词表也刻意把 `bot_schedule_plan` 等排除在蒸馏之外。故桥包默认通道拿不到任何日程数据。
+- **"情绪余波双源"**：不构成"同一数据的重复"。PC 的 `unanswered_afterglow` 来自它自己的"未回消息 streak"，本插件的 `_afterglow_line` 来自 `emotion_ledger`（`peek_pending`）。两者**来源不同**，可能互补也可能口径不一致，但不是重复投递。
+
+### 15.4 已记账但**未修**（需产品决策，勿当 bug 静默改）
+1. **"让位"信号方向存疑 → self_timeline 可能双向让位**。PC 在让位时把段落名写进事件属性（`memory_companion_companion_deferred_sections`），而 `slots.py:165` 用**同一属性**判定"对方已给过，我就不给"，二者语义相反。MC 原版判据是 `companion_state.get("has_self_timeline")`（**PC 真的产出了**才让，见 MC `service.py:10004`），本 fork 换成了"PC 让位"标记。实测（`probe_defer_selfline.py`）：默认配置下 `should_defer("self_timeline")=True` → 本插件把自己那段关掉；而 PC 同期也跳过本地注入 → **两边都不给**；把 `prefer_memory_companion_memory` 关掉则两边都给。**两个方向都不对**，修复需要"PC 实际产出"这一信息（MC 从请求体检测），本插件当前拿不到 → 待定。
+2. **画像通道"接了但只用于展示，不用于生成"**（此条曾误判为"接口名不对齐"，已更正）。核实：
+   - PC **确实**会调本插件的 `read_unified_profile_portrait` / `unified_profile_portrait_status`（PC `main.py:5177/5199/5616/5641/5659/5703`）——**接口名是对齐的**，本插件也实现了。上一版"PC 从不调用"的结论错误，原因是只扫了 `memory_companion_adapter.py` 而漏了 `main.py`。
+   - 但用途只有三类，**都与"讲给模型听"无关**：① 能力探测（决定 WebUI/配置里画像项是否可用）；② 管理员改画像模式时校验后端；③ 用户主动索取"我的画像摘要"（purpose=`summarize_to_subject`）。
+   - **PC 的提示词构建文件里没有任何一处使用 REQ-036 画像**（`user_memory.py` / `proactive_message.py` / `conversation_prompt_section.py` 里出现的 `portrait` 全部是"人像照片"语义）。
+   - 且本插件 `portrait_enabled` 默认 **false**（`memory_engine.py:263` 的 `config.get("portrait_enabled", False)`）。
+   → 结论：画像**从来没有进入对话提示词**，不是"没做"也不是"没接"，而是"只做了展示与能力面"。另有一套名字不同的旧通道（`read_bot_profile` / `read_user_memory_summary`）本插件未实现、PC 有 None 守卫静默降级。
+
+3. **PC 调用的 7 个桥方法本插件未实现**（MC 均有）：`bind_namespace_migration_epoch`、`consume_context_projection`、`consume_person_projection`、`consume_relationship_projection`、`probe_namespace_context_capabilities`、`read_bot_profile`、`read_user_memory_summary`。PC 有 None 守卫 → 静默降级。
+4. **桥忽略调用方传入的会话限定意图**：`_compose_context_inner`（bridge.py:445-451）只读 `session_id`/`scope`/`bot_id`/`message_text`（`_window_label` 另取 user_name/group_name），**丢弃** `platform`/`user_id`/`preferred_address`/`preferred_address_locked`/`strict_session_only`/`topic_fit_policy`/`p5_attestation[_consumer]`。PC 明确传了"只限当前会话""旧话题只作可选参考、别为它改变本轮"，约束未被尊重；跨用户隔离实际只靠 `session_id`。
+5. **`_deferred_sections()` 含 2 个死项**：`companion_memory` / `dialogue_history` 在集合里，但 PC 从不就这两个发起让位询问（PC 只问 self_timeline / private_context / livingmemory_guidance）。
+6. **残留重复（影响面窄，未动）**：仅当 PC 走到 `current_state_reply`，或把 `prefer_memory_companion_memory` 关掉走 `private_recall` 时，桥包的 `core_blocks` 与本插件主链注入的 core block 会在同一轮各出现一次。默认配置下正常私聊轮 PC **不调** `compose_context`（`private_context` 被让位），故不触发。
+
+### 15.5 测试与验证
+- 全量 `pytest tests/ -q` → **847 passed**（846 + 本节新增 1）；`pyflakes` 改动文件零告警。
+- 实证脚本：`probe_defer_selfline.py`（让位方向）、`probe_openloop.py`（未闭环消解）、`probe_composer.py`（预算硬顶）——均留在工作区可复跑。
+
 
 

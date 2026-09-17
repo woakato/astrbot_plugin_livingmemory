@@ -10,8 +10,10 @@ Output metadata feeds engine.load_open_loop_memories / bridge.search_open_loops.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
+
+from ...local_time import local_datetime
 
 # Explicit commitment language. Bare reminders ("记得吃饭") are deliberately
 # NOT strong promises: they only tag when a time/event/pending cue co-occurs.
@@ -88,8 +90,12 @@ _WEEKDAY_RE = re.compile(r"(?:星期|周|礼拜)([一二三四五六日天])")
 
 
 def _due_ts(text: str, now: float) -> float:
-    """Estimate a due timestamp (epoch seconds) from the text; 0 when unclear."""
-    current = datetime.fromtimestamp(now)
+    """Estimate a due timestamp (epoch seconds) from the text; 0 when unclear.
+
+    Resolved against the shared local calendar (Asia/Shanghai): using the naive
+    process-local clock made the estimate drift with the deployment's timezone.
+    """
+    current = local_datetime(now)
     base = current.replace(hour=20, minute=0, second=0, microsecond=0)
 
     for mark, days in _NEAR_DAYS:

@@ -567,3 +567,61 @@ async def test_resolve_open_loops_ignores_generic_overlap(tmp_path: Path):
         assert await engine.load_open_loop_memories(session_id="s1") == []
     finally:
         await engine.close()
+
+
+# ----------------------------------------------------------------------
+# duplicate suppression: the bridge package must not re-pack open loops
+#
+# The companion plugin renders open loops from the dedicated
+# search_open_loops channel, and the fork's own main-chain injection carries
+# them through collect_slots. Packing them a third time inside compose_context
+# put the same loops into the proactive prompt twice within one turn.
+# ----------------------------------------------------------------------
+
+
+class _LoopEngine:
+    """Minimal engine exposing only the loaders the bridge reads."""
+
+    async def load_open_loop_memories(self, session_id: str | None = None, limit: int = 3):
+        return [
+            {
+                "memory_id": 7,
+                "content": "明天要面试，记得问结果",
+                "session_id": session_id or "",
+                "due_ts": 0.0,
+                "age_days": 0,
+                "promise": True,
+                "create_time": 0.0,
+            }
+        ]
+
+    async def load_core_memories(self, session_id: str | None = None, **kw):
+        return []
+
+    async def search_memories(self, query: str = "", k: int = 5, session_id=None):
+        return []
+
+
+class _Initializer:
+    def __init__(self, engine) -> None:
+        self.memory_engine = engine
+
+
+@pytest.mark.asyncio
+async def test_bridge_package_omits_open_loops_but_channel_keeps_them():
+    plugin = _FakePlugin(enabled=True)
+    plugin.initializer = _Initializer(_LoopEngine())
+    bridge = CompanionBridge(plugin)
+
+    package = await bridge.compose_context(
+        query="面试结果怎么样",
+        session_context={"session_id": "aiocqsub:u1", "scope": "private"},
+    )
+    # The query itself is echoed into the package, so assert on the loop-only
+    # phrase rather than the topic word.
+    assert "记得问结果" not in package, "桥包不应再打包未闭环（同轮已有专用通道）"
+
+    loops = await bridge.search_open_loops(session_id="aiocqsub:u1", limit=3)
+    assert loops, "专用未闭环通道必须仍然可用"
+    assert "记得问结果" in loops[0]["content"]
+

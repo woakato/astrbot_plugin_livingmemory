@@ -30,8 +30,15 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ...storage.companion_store import SUMMARY_BOUND_MEMORY_TYPES
 from .composer import MemoryItem, PackageComposer
-from .contracts import bot_personal_contract, emotion_event_contract
+from .contracts import (
+    affect_modulation,
+    bot_personal_contract,
+    emotion_event_contract,
+    unified_profile_contract,
+)
+from .situation import atmosphere_lines
 
 PC_PLUGIN_IDENTITY = "astrbot_plugin_private_companion"
 PC_NAME_ALIASES = frozenset({"PrivateCompanion", "private_companion"})
@@ -108,6 +115,13 @@ _RECORD_DEFAULTS: dict[str, dict[str, Any]] = {
     },
 }
 
+# memory_types whose content belongs on the conversation timeline as well.
+# Spec §0 数据分诊: 互动流水（含说说、创作）走 时间线→总结→原子；日程/日记
+# 只留在窗口索引，永不进总结。MC 是把这些一律 insert_memory 进长期库，那会把
+# 日程也灌进总结，与分诊表相反——所以这里按类型分流，不照搬 MC。
+# 词表定义在 storage.companion_store（存储层拥有分诊词汇），此处只做别名。
+_SUMMARY_BOUND_TYPES = SUMMARY_BOUND_MEMORY_TYPES
+
 # companion_events kinds for time-window storage (bot_self mirror stream).
 _EVENT_KIND_TYPES = frozenset(
     {
@@ -179,6 +193,53 @@ class CompanionBridge:
         self._producers: dict[str, _ProducerCapability] = {}
         # token -> capability, rotates on deactivate to invalidate old tokens
         self._token_epoch = uuid.uuid4().hex[:8]
+        # Spec §4: the vendored contract copies are fingerprint-checked against
+        # the companion's own at handshake time. A locally drifted copy must
+        # degrade this bridge rather than advertise a contract we no longer
+        # honour — so the check runs once at construction, not only in tests.
+        self._contract_issues = self._run_contract_self_check()
+
+    @staticmethod
+    def _run_contract_self_check() -> list[str]:
+        """Recompute every vendored contract's self-check.
+
+        Only ``bot_personal_contract`` and ``unified_profile_contract`` ship a
+        ``contract_self_check``; the other vendored copies have no equivalent,
+        so they are skipped rather than treated as failures. Iterating the full
+        set keeps this future-proof if a checker is added later.
+
+        Returns:
+            Human-readable issue strings; empty when all contracts are intact.
+        """
+        issues: list[str] = []
+        for name, module in (
+            ("bot_personal_contract", bot_personal_contract),
+            ("unified_profile_contract", unified_profile_contract),
+            ("emotion_event_contract", emotion_event_contract),
+            ("affect_modulation", affect_modulation),
+        ):
+            checker = getattr(module, "contract_self_check", None)
+            if not callable(checker):
+                continue
+            try:
+                found = checker() or []
+            except Exception as exc:  # noqa: BLE001
+                issues.append(f"{name}: self_check 抛异常 {exc}")
+                continue
+            issues.extend(f"{name}: {item}" for item in found)
+        if issues:
+            logger.error(
+                "[companion] 契约自检失败，桥接降级为不可用: "
+                + "; ".join(issues[:5])
+            )
+        return issues
+
+    def contract_health(self) -> dict[str, Any]:
+        """Diagnostic surface for the vendored contract copies (additive)."""
+        return {
+            "ok": not self._contract_issues,
+            "issues": list(self._contract_issues),
+        }
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -190,13 +251,15 @@ class CompanionBridge:
         self._producers.clear()
 
     def _disabled(self) -> bool:
-        """Single gate: lifecycle token plus the enabled config switch."""
+        """Single gate: lifecycle token, contract integrity, enabled config."""
         if not self._active:
+            return True
+        if self._contract_issues:
             return True
         return not bool(self._cfg("enabled", True))
 
     def bridge_lifecycle_status(self) -> dict[str, Any]:
-        return {"active": bool(self._active and self._cfg("enabled", True))}
+        return {"active": not self._disabled()}
 
     # ------------------------------------------------------------------
     # handshake
@@ -243,9 +306,12 @@ class CompanionBridge:
         return probe
 
     def _implemented_method_names(self) -> list[str]:
+        # Local-only helpers are excluded so the probe's `methods` list keeps
+        # advertising exactly the companion-facing surface.
+        _local_only = ("deactivate", "contract_health")
         names = []
         for attr in dir(CompanionBridge):
-            if attr.startswith("_") or attr in ("deactivate",):
+            if attr.startswith("_") or attr in _local_only:
                 continue
             if callable(getattr(CompanionBridge, attr, None)):
                 names.append(attr)
@@ -413,6 +479,7 @@ class CompanionBridge:
             current_message=str(ctx.get("message_text") or ""),
             window_label=self._window_label(scope, ctx),
             mood=str(kwargs.get("companion_bot_mood") or ""),
+            energy=float(kwargs.get("companion_bot_energy") or 0.0),
         )
         return composer.wrap_for_bridge(pkg)
 
@@ -469,11 +536,17 @@ class CompanionBridge:
         current_message: str,
         window_label: str,
         mood: str,
+        energy: float = 0.0,
     ):
         engine = self._engine()
         items: list[MemoryItem] = []
         core_blocks: list[dict[str, Any]] = []
-        loops: list[MemoryItem] = []
+        # Open loops are deliberately NOT packed here. The bridge already
+        # exposes them through the dedicated search_open_loops channel (which
+        # the companion renders as its own prompt section), and the fork's own
+        # main-chain injection carries them via collect_slots. Loading them a
+        # third time inside this package put the same loops into the proactive
+        # prompt twice in one turn.
         if engine is not None and query.strip():
             try:
                 results = await engine.search_memories(
@@ -492,12 +565,14 @@ class CompanionBridge:
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"[companion_bridge] search degraded: {exc}")
             core_blocks = await self._load_core_blocks(engine, session_id)
-            loops = await self._load_open_loops(session_id)
         one_lines = await self._afterglow_line(session_id=session_id)
+        # 局面线索的心情 / 精力（spec §0）：MC 在注入组装阶段消费它们，决定
+        # "以什么方式提起"记忆，所以这一路留在桥内；只产出提示行，不落库。
+        for hint in atmosphere_lines(mood, energy):
+            one_lines.append(("atmosphere_hint", hint))
         return composer.compose(
             core_blocks=core_blocks,
             one_line_slots=one_lines,
-            open_loops=loops,
             retrieval_items=items,
             current_message=current_message,
             window_label=window_label,
@@ -514,25 +589,6 @@ class CompanionBridge:
             return await loader(session_id=session_id)
         except Exception:  # noqa: BLE001
             return []
-
-    async def _load_open_loops(self, session_id: str) -> list[MemoryItem]:
-        loader = getattr(self._engine(), "load_open_loop_memories", None)
-        if loader is None:
-            return []
-        try:
-            rows = await loader(session_id=session_id or None, limit=3)
-        except Exception:  # noqa: BLE001
-            return []
-        from .slots import _loop_text
-
-        return [
-            MemoryItem(
-                text=_loop_text(row),
-                source="open_loop",
-                weight=0.5 if row.get("promise") else 0.0,
-            )
-            for row in rows
-        ]
 
     async def _afterglow_line(
         self, *, bot_id: str = "", session_id: str = ""
@@ -783,11 +839,69 @@ class CompanionBridge:
                 )
                 if deduped:
                     logger.debug(f"[companion_bridge] dedupe hit: {event_key[:16]}")
+                # 分诊（spec §0）：说说/创作 必须同时进对话时间线，才能被
+                # 总结链带到长期库。无论本轮是否命中去重都尝试一次——镜像
+                # 自带查重，可补上一次镜像失败的情况。
+                if str(memory_type) in _SUMMARY_BOUND_TYPES:
+                    await self._mirror_summary_bound(
+                        content=str(content),
+                        scope=str(scope),
+                        session_id=str(session_id),
+                        platform=str(platform),
+                        user_id=user_id,
+                        group_id=str(group_id),
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[companion_bridge] record dropped: {exc}")
 
         self._plugin.spawn_companion_background(_persist())
         return event_key
+
+    async def _mirror_summary_bound(
+        self,
+        *,
+        content: str,
+        scope: str,
+        session_id: str,
+        platform: str,
+        user_id: str,
+        group_id: str,
+    ) -> None:
+        """Mirror 说说/创作 onto the conversation timeline (summary-bound).
+
+        These memory_types are 互动流水 per spec §0: they belong on the same
+        timeline as chat and user messages so 总结→原子 reaches them. 日程 and
+        日记 deliberately do not come through here.
+
+        Zero new storage: the row the reflection pipeline summarises *is* the
+        long-term path. A recent identical assistant turn is treated as already
+        mirrored, so companion retries never double-write into summaries.
+        """
+        manager = getattr(getattr(self._plugin, "initializer", None), "conversation_manager", None)
+        if manager is None or not str(content).strip():
+            return
+        wanted = str(content).strip()
+        try:
+            sid = session_id or f"{platform or 'private_companion'}:{scope or 'bot_self'}"
+            recent = await manager.get_messages(sid, limit=20)
+            for msg in reversed(recent):
+                if (
+                    getattr(msg, "role", "") == "assistant"
+                    and str(getattr(msg, "content", "")).strip() == wanted
+                ):
+                    return
+            await manager.add_message(
+                sid,
+                role="assistant",
+                content=wanted[:4000],
+                sender_id=user_id or bot_self_id(self._bot_id_of()),
+                sender_name="Bot",
+                group_id=group_id or None,
+                platform=platform or "unknown",
+                is_bot_message=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[companion_bridge] summary-bound mirror dropped: {exc}")
 
     async def record_bot_personal_archive(
         self,
@@ -844,9 +958,13 @@ class CompanionBridge:
         owner_bot_id = _s("owner_bot_id", 160)
         persona_id = _s("persona_id", 160)
         # Namespace cross-check mirroring MC: producer hooks must match DTO.
-        bot_hook = getattr(producer_capability, "bot_id", "")
+        # Canonicalize both sides first — the hook carries a bare self_id while
+        # an envelope may carry a platform-prefixed one ("aiocqhttp:10001").
+        # They are the same namespace, so comparing them raw would raise a
+        # spurious producer_namespace_mismatch.
+        bot_hook = _canonical_bot_id(getattr(producer_capability, "bot_id", ""))
         persona_hook = getattr(producer_capability, "persona_id", "")
-        if bot_hook and owner_bot_id and bot_hook != owner_bot_id:
+        if bot_hook and owner_bot_id and bot_hook != _canonical_bot_id(owner_bot_id):
             return {
                 "ok": False,
                 "record_id": record_id,

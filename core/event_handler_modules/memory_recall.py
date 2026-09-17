@@ -6,7 +6,7 @@
 import asyncio
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
@@ -15,9 +15,11 @@ from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
+from ...local_time import local_day_label
 from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
 from ..companion.composer import MemoryItem, PackageComposer
 from ..companion.gate import decide_gate, parse_time_window
+from ..companion.situation import expand_query, read_situation
 from ..companion.portrait_service import resolve_turn_scope, spawn_portrait_capture
 from ..companion.slots import collect_slots
 from ..memory_scope import (
@@ -51,14 +53,13 @@ _TIME_MARK_RE = re.compile(
 
 
 def _date_label(create_time: object) -> str:
-    """Compact YYYY-MM-DD label for a metadata create_time (epoch seconds)."""
-    try:
-        ts = float(create_time or 0)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return ""
-    if ts <= 0:
-        return ""
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    """Compact YYYY-MM-DD label for a metadata create_time (epoch seconds).
+
+    Uses the shared local calendar (Asia/Shanghai). A UTC label showed the
+    previous day for anything created between 00:00 and 08:00 Beijing time,
+    which disagreed with the day buckets the companion store writes.
+    """
+    return local_day_label(create_time)  # type: ignore[arg-type]
 
 
 class MemoryRecall:
@@ -338,6 +339,29 @@ class MemoryRecall:
                     except Exception as e:
                         logger.warning(f"[{session_id}] 获取上下文扩展失败: {e}")
 
+                # 局面线索（spec §0 数据分诊）：PC 把 private_companion_context
+                # 挂在事件上，只用于本轮扩写检索词、不落库。落点必须在这里而不是
+                # 桥内——PC 调 compose_context 时只传 query/session_context/mood/
+                # energy，事件对象不在参数里，桥上取不到这些线索。
+                # 话题与当前消息无重叠时丢弃，避免旧话头把本轮检索带偏。
+                try:
+                    situation = read_situation(event)
+                    if situation:
+                        query_for_search, clue_status = expand_query(
+                            query_for_search, situation, message_query=actual_query
+                        )
+                        if clue_status == "guarded_overlap":
+                            logger.info(
+                                f"[{session_id}] 局面线索扩写检索词"
+                                f"（{clue_status}）"
+                            )
+                        elif clue_status == "guarded_no_overlap":
+                            logger.debug(
+                                f"[{session_id}] 局面线索与当前消息无重叠，已忽略"
+                            )
+                except Exception as e:
+                    logger.debug(f"[{session_id}] 局面线索处理失败: {e}")
+
                 # 执行记忆召回
                 logger.info(
                     f"[{session_id}] 开始记忆召回，查询='{query_for_search[:80]}...'"
@@ -489,10 +513,10 @@ class MemoryRecall:
                 ):
                     try:
                         provider = self.context.get_using_provider(session_id)
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             f"[{session_id}] 获取当前 Provider 失败，"
-                            "将按无 Provider 继续解析注入模式: {e}"
+                            f"将按无 Provider 继续解析注入模式: {exc}"
                         )
                 injection_method, fallback_reason = self.injection_adapter.resolve(
                     provider, configured_method

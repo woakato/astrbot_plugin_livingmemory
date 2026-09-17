@@ -161,8 +161,12 @@ def test_backup_includes_graph_files(tmp_path: Path) -> None:
     assert (backup_path / "livingmemory_graph.index").exists()
 
 
-def test_backup_includes_wal_shm_files(tmp_path: Path) -> None:
-    """WAL 和 SHM 日志文件应通过通配符被备份。"""
+def test_backup_excludes_live_wal_shm_files(tmp_path: Path) -> None:
+    """WAL/SHM 不应被独立复制，一致性快照改由 SQLite 在线备份 API 产出。
+
+    单独的 -wal/-shm 拷贝可能与主库文件不是同一版本，产出一个看似完整、
+    实际分页不一致的备份 —— 而这份备份正是升级失败时的唯一退路。
+    """
     (tmp_path / "livingmemory.db").write_text("main")
     (tmp_path / "livingmemory.db-wal").write_text("wal")
     (tmp_path / "livingmemory.db-shm").write_text("shm")
@@ -172,8 +176,36 @@ def test_backup_includes_wal_shm_files(tmp_path: Path) -> None:
     backup_dir = mgr.backup_if_needed()
 
     backup_path = Path(backup_dir)
-    assert (backup_path / "livingmemory.db-wal").exists()
-    assert (backup_path / "livingmemory.db-shm").exists()
+    assert (backup_path / "livingmemory.db").exists()
+    assert not (backup_path / "livingmemory.db-wal").exists()
+    assert not (backup_path / "livingmemory.db-shm").exists()
+
+
+def test_backup_uses_sqlite_online_backup_api(tmp_path: Path) -> None:
+    """真实 SQLite 库经在线备份 API 复制，且副本可独立打开并含已提交数据。"""
+    import sqlite3
+
+    db = tmp_path / "livingmemory.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("INSERT INTO t (v) VALUES ('kept')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    mgr = BackupManager(str(tmp_path))
+    mgr.version_file.write_text("2.0.0", encoding="utf-8")
+    backup_dir = mgr.backup_if_needed()
+
+    copied = Path(backup_dir) / "livingmemory.db"
+    assert copied.exists()
+    clone = sqlite3.connect(str(copied))
+    try:
+        assert clone.execute("SELECT v FROM t").fetchone()[0] == "kept"
+    finally:
+        clone.close()
 
 
 def test_get_stored_version_oserror_returns_none(tmp_path: Path) -> None:

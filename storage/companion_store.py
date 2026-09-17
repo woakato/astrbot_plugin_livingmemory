@@ -20,21 +20,36 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
 
+from ..local_time import TZ_SHANGHAI as _TZ_SHANGHAI
+
 # Companion event dates are Beijing-local: every user-facing "today" query
 # (self-line, fast context) reads the local calendar day, so storage must
 # bucket by the same timezone or early-morning events land on the wrong day.
-_TZ_SHANGHAI = timezone(timedelta(hours=8))
+# The timezone itself lives in ``local_time`` so recall and open-loop tagging
+# cannot drift to a different clock again.
 
 # Acked afterglow rows older than this are cleared by the weekly task.
 _EMOTION_RETENTION_SECONDS = 7 * 24 * 3600
 
 # Mirror MC's afterglow half-life default for events without explicit expiry.
 _DEFAULT_AFTERGLOW_TTL_SECONDS = 24 * 3600
+
+# ---------------------------------------------------------------------------
+# 数据分诊词表（spec §0）——单一事实源，bridge 与维护调度器都从这里取。
+# ---------------------------------------------------------------------------
+
+#: 必须同时进对话时间线（→总结→原子）的 memory_types：互动流水里的说说/创作。
+SUMMARY_BOUND_MEMORY_TYPES = frozenset({"qzone_action", "creative_work"})
+
+#: 允许每周蒸馏进长期库的归档类型。日程类（bot_schedule_plan /
+#: bot_window_snapshot / bot_schedule_reconciliation）**故意不在其中**：
+#: 分诊表要求日程永远不进总结。
+DIARY_ARCHIVE_MEMORY_TYPES = frozenset({"bot_daily_diary"})
 
 
 def to_epoch_seconds(value: Any) -> float:
@@ -239,44 +254,56 @@ class CompanionStore:
             version_conflict), version (the winning row's version),
             deduplicated (bool).
         """
+        # One connection, one IMMEDIATE transaction: the DELETE and the
+        # re-INSERT must be atomic. Splitting them across connections (the
+        # previous shape) meant a crash in between erased the row's entire
+        # version history, and a concurrent writer's INSERT could be silently
+        # swallowed by ON CONFLICT DO NOTHING — reporting success while
+        # dropping a higher version.
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT CAST(COALESCE(json_extract(metadata, '$.archive_version'), 1)"
-                " AS INTEGER) AS version, "
-                "COALESCE(json_extract(metadata, '$.payload_fingerprint'), '') AS fp "
-                "FROM companion_events WHERE event_key = ?",
-                (event_key,),
-            ) as cursor:
-                old = await cursor.fetchone()
-        if old is not None:
-            old_version = int(old["version"] or 1)
-            if old_version > version:
-                return {
-                    "state": "stale_version",
-                    "version": old_version,
-                    "deduplicated": False,
-                }
-            if old_version == version:
-                if str(old["fp"] or "") == fingerprint:
-                    return {
-                        "state": "deduplicated",
-                        "version": old_version,
-                        "deduplicated": True,
-                    }
-                return {
-                    "state": "version_conflict",
-                    "version": old_version,
-                    "deduplicated": False,
-                }
-            # Incoming version higher: supersede before re-inserting, each
-            # statement in its own connection so the nested upsert_event
-            # (second connection) never races a held write lock.
-            async with self._connect() as db:
-                await db.execute(
-                    "DELETE FROM companion_events WHERE event_key = ?", (event_key,)
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT CAST(COALESCE(json_extract(metadata, '$.archive_version'), 1)"
+                    " AS INTEGER) AS version, "
+                    "COALESCE(json_extract(metadata, '$.payload_fingerprint'), '') AS fp "
+                    "FROM companion_events WHERE event_key = ?",
+                    (event_key,),
+                ) as cursor:
+                    old = await cursor.fetchone()
+                if old is not None:
+                    old_version = int(old["version"] or 1)
+                    if old_version > version:
+                        await db.rollback()
+                        return {
+                            "state": "stale_version",
+                            "version": old_version,
+                            "deduplicated": False,
+                        }
+                    if old_version == version:
+                        await db.rollback()
+                        if str(old["fp"] or "") == fingerprint:
+                            return {
+                                "state": "deduplicated",
+                                "version": old_version,
+                                "deduplicated": True,
+                            }
+                        return {
+                            "state": "version_conflict",
+                            "version": old_version,
+                            "deduplicated": False,
+                        }
+                    # Incoming version higher: supersede within this transaction.
+                    await db.execute(
+                        "DELETE FROM companion_events WHERE event_key = ?", (event_key,)
+                    )
+                _key, deduped = await self._insert_event_row(
+                    db, event_key=event_key, **fields
                 )
                 await db.commit()
-        _key, deduped = await self.upsert_event(event_key=event_key, **fields)
+            except BaseException:
+                await db.rollback()
+                raise
         if deduped:
             # Lost a race against an identical insert: treat as dedupe.
             return {"state": "deduplicated", "version": version, "deduplicated": True}
@@ -309,39 +336,85 @@ class CompanionStore:
             (event_key, deduplicated) — deduplicated=True means the event was
             already stored and nothing changed.
         """
+        async with self._connect() as db:
+            key, deduped = await self._insert_event_row(
+                db,
+                kind=kind,
+                content=content,
+                bot_id=bot_id,
+                persona_id=persona_id,
+                scope=scope,
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                window_slug=window_slug,
+                occurred_at=occurred_at,
+                importance=importance,
+                metadata=metadata,
+                event_key=event_key,
+            )
+            await db.commit()
+            return key, deduped
+
+    async def _insert_event_row(
+        self,
+        db: Any,
+        *,
+        kind: str,
+        content: str,
+        bot_id: str = "",
+        persona_id: str = "",
+        scope: str = "",
+        session_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        window_slug: str = "",
+        occurred_at: Any = None,
+        importance: float = 0.5,
+        metadata: dict | None = None,
+        event_key: str = "",
+    ) -> tuple[str, bool]:
+        """Insert one companion_events row on the caller's connection.
+
+        Shared by ``upsert_event`` and ``upsert_archive_event`` so the archive
+        supersede path (DELETE + re-INSERT) can run inside a single
+        transaction. The caller owns commit/rollback.
+
+        Returns:
+            (event_key, deduplicated) — deduplicated=True means the row already
+            existed and nothing changed.
+        """
         ts = to_epoch_seconds(occurred_at)
         key = event_key or self.make_event_key(
             kind, bot_id, scope, session_id, user_id or group_id, content, ts
         )
-        async with self._connect() as db:
-            cursor = await db.execute(
-                """
-                INSERT INTO companion_events
-                    (event_key, kind, content, bot_id, persona_id, scope, session_id,
-                     user_id, group_id, event_date, window_slug, occurred_at,
-                     importance, metadata)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(event_key) DO NOTHING
-                """,
-                (
-                    key,
-                    kind,
-                    content[:4000],
-                    bot_id,
-                    persona_id,
-                    scope,
-                    session_id,
-                    user_id,
-                    group_id,
-                    event_date_of(ts),
-                    window_slug,
-                    ts,
-                    importance,
-                    json.dumps(metadata or {}, ensure_ascii=False),
-                ),
-            )
-            await db.commit()
-            return key, cursor.rowcount == 0
+        cursor = await db.execute(
+            """
+            INSERT INTO companion_events
+                (event_key, kind, content, bot_id, persona_id, scope, session_id,
+                 user_id, group_id, event_date, window_slug, occurred_at,
+                 importance, metadata)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(event_key) DO NOTHING
+            """,
+            (
+                key,
+                kind,
+                content[:4000],
+                bot_id,
+                persona_id,
+                scope,
+                session_id,
+                user_id,
+                group_id,
+                event_date_of(ts),
+                window_slug,
+                ts,
+                importance,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+        return key, cursor.rowcount == 0
 
     async def list_events_between(
         self,
@@ -425,6 +498,27 @@ class CompanionStore:
             The stored event dict including delivery_state.
         """
         event_id = str(event.get("event_id") or "")
+        if not event_id:
+            # A missing event_id must not collapse distinct events onto the TEXT
+            # primary key '' (each insert would silently overwrite the last).
+            # Derive a deterministic id from the payload so retries stay
+            # idempotent while different events keep distinct rows.
+            event_id = self.stable_key(
+                "lmemle_",
+                json.dumps(
+                    {
+                        "trace_id": event.get("trace_id") or "",
+                        "event_type": event.get("event_type") or "",
+                        "occurred_at": event.get("occurred_at") or "",
+                        "payload_hash": event.get("payload_hash") or "",
+                        "intensity": event.get("intensity") or 0.0,
+                        "user_id": context.get("user_id", ""),
+                        "session_id": context.get("session_id", ""),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
         occurred = to_epoch_seconds(event.get("occurred_at"))
         expires = (
             to_epoch_seconds(event.get("expires_at"))
@@ -484,6 +578,7 @@ class CompanionStore:
                     energy_delta=excluded.energy_delta, valence=excluded.valence,
                     arousal=excluded.arousal, vulnerability=excluded.vulnerability,
                     expires_at=excluded.expires_at, occurred_at=excluded.occurred_at,
+                    payload_hash=excluded.payload_hash,
                     delivery_state='pending', consumer_id='', acked_at=0.0,
                     modulation=excluded.modulation, raw_event=excluded.raw_event
                 """,
@@ -600,9 +695,13 @@ class CompanionStore:
             async with self._connect() as db:
                 ids = [item["event_id"] for item in out]
                 marks = ",".join("?" * len(ids))
+                # Guard on delivery_state='pending': an ack landing between the
+                # SELECT above and this UPDATE must not be reverted to
+                # 'delivered', otherwise acked_at/consumer_id are lost and the
+                # event re-enters the delivery list (spec §2.4 / §9 item 4).
                 await db.execute(
                     f"UPDATE emotion_ledger SET delivery_state = 'delivered' "
-                    f"WHERE event_id IN ({marks})",
+                    f"WHERE delivery_state = 'pending' AND event_id IN ({marks})",
                     ids,
                 )
                 await db.commit()
@@ -742,6 +841,55 @@ class CompanionStore:
                 event_ids,
             )
             await db.commit()
+
+    async def list_undistilled_diaries(
+        self, *, memory_types: tuple[str, ...] | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Archive rows of the given types not yet distilled into long-term memory.
+
+        Only the archive ``metadata.archive_memory_type`` separates a diary from a
+        schedule entry — both are stored with ``kind='archive'`` — so the caller
+        passes the types it wants and the schedule types are never matched.
+        """
+        types = tuple(memory_types or DIARY_ARCHIVE_MEMORY_TYPES)
+        if not types:
+            return []
+        marks = ",".join("?" * len(types))
+        sql = (
+            "SELECT event_key, content, occurred_at, metadata FROM companion_events "
+            "WHERE archived = 0 AND kind = 'archive' "
+            f"AND json_extract(metadata, '$.archive_memory_type') IN ({marks}) "
+            "AND COALESCE(json_extract(metadata, '$.diary_distilled'), 0) = 0 "
+            "ORDER BY occurred_at ASC LIMIT ?"
+        )
+        params: list[Any] = [*types, max(1, min(int(limit), 200))]
+        async with self._connect() as db:
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                item["metadata"] = {}
+            out.append(item)
+        return out
+
+    async def mark_diaries_distilled(self, event_keys: list[str]) -> int:
+        """Flag diary rows as distilled (metadata flag, no schema change)."""
+        if not event_keys:
+            return 0
+        marks = ",".join("?" * len(event_keys))
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE companion_events "
+                "SET metadata = json_set(metadata, '$.diary_distilled', 1) "
+                f"WHERE event_key IN ({marks})",
+                event_keys,
+            )
+            await db.commit()
+            return cursor.rowcount
 
     async def purge_expired(self) -> int:
         """Drop acked events past retention, and expired undelivered leftovers."""

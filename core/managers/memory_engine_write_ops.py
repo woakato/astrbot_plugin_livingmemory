@@ -200,6 +200,12 @@ class MemoryEngineWriteOpsMixin:
                 metadata = {}
             if str(metadata.get("status") or "active") != "active":
                 continue
+            # Bot 自述内容（visibility=bot_self，目前由日记蒸馏写入）只允许经
+            # 快线 / 自我行通道进入提示词，不参与常规语义召回——否则 Bot 的日记
+            # 片段会闯进群聊与其他用户的会话。MC 对应的是 RetrievalPolicy 的
+            # bot_self 分支（allow_self_timeline_everywhere 默认 false）。
+            if str(metadata.get("visibility") or "").casefold() == "bot_self":
+                continue
             if (
                 importance_threshold > 0
                 and clamp_float(metadata.get("importance"), default=0.5)

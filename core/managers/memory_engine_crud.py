@@ -1248,6 +1248,22 @@ class MemoryEngineCrudMixin:
         """
         if not content or not content.strip():
             raise ValueError("记忆内容不能为空")
+        if scope not in ("global", "session", "persona", "user"):
+            raise ValueError(f"未知的核心记忆作用域: {scope!r}")
+        # A scoped block without its domain key is unloadable by construction:
+        # load_core_memories is fail-closed, so the row would sit in the DB
+        # reachable by no turn at all while the caller still saw success.
+        # Fail loudly instead of silently storing dead data.
+        domain_key = {
+            "session": ("session_id", session_id),
+            "persona": ("persona_id", persona_id),
+            "user": ("user_id", user_id),
+        }.get(scope)
+        if domain_key is not None and not str(domain_key[1] or "").strip():
+            raise ValueError(
+                f"作用域 scope={scope!r} 必须提供 {domain_key[0]}，"
+                "否则该核心记忆不会被任何一轮对话注入"
+            )
         if self.db_connection is None:
             raise RuntimeError("数据库连接未初始化")
         now = time.time()
@@ -1436,6 +1452,11 @@ class MemoryEngineCrudMixin:
             List of dicts with memory_id/content/age_days/due_ts/promise/
             reason keys, most urgent first.
         """
+        # Fail closed: without a session domain the query would return every
+        # session's unfinished topics (cross-session leak). Mirrors the
+        # load_core_memories / peek_pending convention.
+        if not session_id:
+            return []
         now = time.time()
         try:
             if self.db_connection is None:
@@ -1467,7 +1488,7 @@ class MemoryEngineCrudMixin:
                 or meta.get("session_id")
                 or ""
             )
-            if session_id and row_session and row_session != session_id:
+            if not row_session or row_session != session_id:
                 continue
             create_time = float(meta.get("create_time") or row["id"] * 0 or now)
             due_ts = float(meta.get("due_ts") or 0.0)
@@ -1562,15 +1583,42 @@ class MemoryEngineCrudMixin:
         message_terms_set = set(message_terms(text))
         if not message_terms_set:
             return []
+        # A reply that only *mentions* the topic should not settle it; require
+        # the message to read like the matter got resolved ("面试过了" /
+        # "搬家搬完了"). Only consulted when the topic overlap stands alone.
+        resolution_markers = (
+            "了",
+            "过",
+            "完",
+            "成",
+            "好",
+            "结束",
+            "搞定",
+            "取消",
+            "不去",
+            "没去",
+            "延期",
+            "改期",
+            "确认",
+            "定下来",
+            "done",
+        )
+        resolved_like = any(marker in text for marker in resolution_markers)
         closed: list[int] = []
         for loop in loops:
             content = str(loop.get("content") or "")
             loop_terms = set(message_terms(content))
             overlap = message_terms_set & loop_terms
             specific_overlap = {t for t in overlap if not any(g in t for g in generic)}
-            # Close only with >=2 shared terms of which at least one is a
-            # topic-specific carry word (面试/演唱会/...), never pure date chatter.
-            if len(overlap) >= 2 and specific_overlap:
+            # The topic-specific overlap is the real discriminator. The old rule
+            # additionally demanded >=2 shared terms, which is unsatisfiable for
+            # two-character topics: message_terms slides 2-4 grams, so "面试"
+            # yields exactly one overlapping n-gram and the loop could never be
+            # closed — even the example in this method's own docstring failed.
+            # Keep >=2 as one sufficient path, and allow a single topic term
+            # when the reply also carries a resolution marker.
+            topical = bool(specific_overlap) and (len(overlap) >= 2 or resolved_like)
+            if topical:
                 if await self.close_open_loop(int(loop["memory_id"])):
                     closed.append(int(loop["memory_id"]))
                 if len(closed) >= max_close:
