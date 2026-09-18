@@ -3,4 +3,4 @@ author: lxfight
 version: 3.0.0
 display_name: 我会牢牢记住你
 description: 为 AstrBot 打造的、拥有完整记忆生命周期的智能长期记忆插件。(v3.0 companion fork：LM 内核 + private_companion 桥兼容，显示名用于陪伴侧按名识别)
-repo: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory
+repo: https://github.com/woakato/astrbot_plugin_livingmemory
